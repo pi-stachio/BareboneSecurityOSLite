@@ -64,6 +64,7 @@ if [ "$up" = 1 ]; then
           ping -c2 -W3 10.0.2.2
           curl -sS -I --max-time 20 https://example.com | head -1
           echo '"$ADMINPW"' | sudo -S id
+          echo '"$ADMINPW"' | sudo -S /usr/sbin/security-audit
          ' > "$SSHLOG" 2>&1
     echo "--- ssh session output ---"
     sed -e 's/^+ /$ /' "$SSHLOG"
@@ -94,6 +95,18 @@ ck '2 (packets )?received|2 received' "$SSHLOG" 'ping works (iputils)'
 ck 'HTTP/[12perf.]* 200'          "$SSHLOG" 'HTTPS fetch succeeded (curl + trust store)'
 ck 'uid=0\(root\)'                "$SSHLOG" 'sudo escalates to root'
 ck 'Unmounting all other'         "$LOG"    'clean shutdown'
+# Hardening
+ck 'landlock active'              "$SSHLOG" 'landlock LSM active'
+ck 'yama active'                  "$SSHLOG" 'yama LSM active'
+ck 'lockdown active'              "$SSHLOG" 'lockdown LSM active'
+ck 'no loadable modules present'  "$SSHLOG" 'kernel has no loadable modules'
+ck 'inbound policy is drop'       "$SSHLOG" 'firewall default-denies inbound'
+if grep -qE '^ *[0-9]+ passed, [0-9]+ warnings, 0 failures' "$SSHLOG"; then
+    printf 'OK:    %s\n' 'security audit reports no failures'
+else
+    printf 'ERROR: %s\n' 'security audit reported failures'; fail=1
+    sed -n '/FAIL/p' "$SSHLOG" | head -8
+fi
 
 echo
 [ "$fail" = 0 ] && echo "RESULT: the system is administrable - SSH, sudo, DNS, ping and TLS all work." \

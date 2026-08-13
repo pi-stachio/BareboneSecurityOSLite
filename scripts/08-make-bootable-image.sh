@@ -88,9 +88,13 @@ insmod ext2
 
 menuentry "Barebone LFS 13.0 (SysV), Linux $KERNEL" {
     set root=(hd0,msdos1)
-    linux /boot/$KERNEL root=/dev/sda1 ro console=tty0 console=ttyS0,115200 net.ifnames=0
+    linux /boot/$KERNEL root=/dev/sda1 ro console=tty0 console=ttyS0,115200 net.ifnames=0 lockdown=integrity
 }
 EOF
+# lockdown=integrity activates the lockdown LSM: it blocks the interfaces that let root
+# modify the running kernel (raw device writes, unsigned module loads, kexec). It is set
+# on the command line rather than compiled as "force" so it can be turned off for
+# debugging by editing this line.
 # net.ifnames=0 disables udev's predictable interface naming. LFS' chapter 9 network
 # config is written for "eth0", but udev would name the NIC enp0s3 or similar, so the
 # network bootscript fails at boot with "Interface eth0 doesn't exist".

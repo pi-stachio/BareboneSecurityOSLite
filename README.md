@@ -63,6 +63,30 @@ automation, which reads the book's XML and runs the book's commands — so this 
 reimplementation of LFS, it's LFS. `07-run-build.sh` is resumable: it stamps each completed
 target, so re-running continues from a failure rather than restarting.
 
+### The hardening layer
+
+```bash
+bash scripts/12-harden-kernel.sh         # hardened kernel, no loadable modules
+bash scripts/13-firewall.sh              # nftables, default-deny inbound
+bash scripts/14-harden-config.sh         # sysctl, sshd, umask, SUID trim
+bash scripts/15-rebuild-gmp-portable.sh  # remove build-CPU tuning from GMP
+bash scripts/08-make-bootable-image.sh   # fold into a new image
+```
+
+The kernel gets KASLR, hardened usercopy, `INIT_ON_ALLOC`/`INIT_ON_FREE`, slab freelist
+hardening and randomised kmalloc caches, plus **Landlock, Yama and lockdown** as LSMs.
+Loadable module support is compiled out entirely, along with `/dev/mem`, `/proc/kcore`,
+kexec, hibernation and 32-bit syscall emulation.
+
+Userspace gets a default-deny nftables ruleset that loads *before* the network comes up,
+a hardened sysctl set, key-only SSH restricted to the `wheel` group, and a SUID trim from
+11 binaries to 8 — with `ping`, `ping6` and `traceroute` moved from setuid-root to a
+`cap_net_raw` capability.
+
+Run `security-audit` on the running system to check all of it. It reports honestly,
+including the ELF hardening that is **not** yet applied — full RELRO and PIE across every
+package needs the toolchain rebuild, which this project has not done yet.
+
 ### The administrable layer
 
 A pure LFS system has no `ping`, no `ssh`, no `sudo` and no TLS trust store — it can
@@ -150,6 +174,26 @@ one capability — `setcap cap_net_raw+p /usr/bin/ping` — rather than making i
 **QEMU's `hostfwd` accepts TCP connections whether or not the guest is listening.** So
 "wait until the port is open" is not a readiness check — it succeeds within seconds of
 starting QEMU and you then connect to nothing. Probe with a real SSH handshake instead.
+
+**GMP bakes in the build machine's CPU.** Its configure script probes the host and emits
+something like `-march=broadwell -mtune=skylake`. Every binary linking libgmp — `nft`, and
+crucially **`gcc`** — then executes those instructions, so the system dies with SIGILL on
+any older CPU or under an emulator presenting a generic one. If you intend to run the
+result anywhere but the machine that built it, configure GMP with `--host=none-linux-gnu`.
+This is easy to miss because testing under `qemu -cpu host` with KVM reproduces the build
+CPU exactly and hides the bug completely.
+
+**An fstab entry for a filesystem the kernel lacks halts the boot.** Adding
+`securityfs` before enabling `CONFIG_SECURITYFS` makes LFS' `S40mountfs` bootscript exit 1,
+and init stops at a "Press Enter to continue" prompt — an unbootable system caused by a
+purely cosmetic auditing feature. `CONFIG_SECURITYFS` is a separate symbol from the LSMs;
+enabling Landlock/Yama/lockdown does not imply it.
+
+**`CONFIG_MODULES=n` silently drops every `=m` symbol.** Disabling loadable modules is a
+large, cheap attack-surface win — but everything defconfig had marked as a module simply
+vanishes rather than becoming built-in. Anything you actually need (here: all the netfilter
+symbols) has to be forced to `=y` explicitly, or you get a kernel with no firewall support
+and no error message saying so.
 
 ## Credits
 
