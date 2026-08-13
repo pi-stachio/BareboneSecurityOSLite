@@ -171,6 +171,11 @@ echo "iputils meson options:$IOPTS"
 meson setup build --prefix=/usr --buildtype=release $IOPTS
 ninja -C build
 ninja -C build install
+# meson's install does not grant ping the ability to open raw sockets, so it fails for
+# non-root users with "missing cap_net_raw+p capability or setuid?". Grant the single
+# capability it needs rather than making the binary setuid root.
+setcap cap_net_raw+p /usr/bin/ping
+getcap /usr/bin/ping
 cd /sources/blfs
 
 step "bootscripts (sshd + dhcpcd service)"

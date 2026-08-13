@@ -38,16 +38,19 @@ qemu-system-x86_64 \
     -display none -serial file:"$LOG" -no-reboot &
 QPID=$!
 
-echo "==> Waiting for sshd (up to 150s)"
-up=0
-for i in $(seq 1 75); do
-    if (exec 3<>/dev/tcp/127.0.0.1/"$PORT") 2>/dev/null; then up=1; echo "    sshd answered after ~$((i*2))s"; break; fi
-    kill -0 "$QPID" 2>/dev/null || { echo "    QEMU exited early"; break; }
-    sleep 2
-done
-
 SSH="ssh -i $KEY -p $PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-     -o LogLevel=ERROR -o ConnectTimeout=8 $ADMINUSER@127.0.0.1"
+     -o LogLevel=ERROR -o ConnectTimeout=8 -o BatchMode=yes $ADMINUSER@127.0.0.1"
+
+# A plain TCP connect is useless here: QEMU's hostfwd accepts the connection on the
+# host side immediately, whether or not anything is listening inside the guest. So
+# probe with a real SSH handshake+login instead.
+echo "==> Waiting for sshd to actually answer (up to 180s)"
+up=0
+for i in $(seq 1 36); do
+    if $SSH true 2>/dev/null; then up=1; echo "    logged in after ~$((i*5))s"; break; fi
+    kill -0 "$QPID" 2>/dev/null || { echo "    QEMU exited early"; break; }
+    sleep 5
+done
 
 if [ "$up" = 1 ]; then
     echo "==> Running checks over SSH"
@@ -55,7 +58,8 @@ if [ "$up" = 1 ]; then
           hostname
           id
           uname -r
-          ip -o -4 addr show eth0
+          /usr/sbin/ip -o -4 addr show eth0   # /usr/sbin is not in a normal user PATH
+          getcap /usr/bin/ping || /usr/sbin/getcap /usr/bin/ping
           cat /etc/resolv.conf | grep -v "^#"
           ping -c2 -W3 10.0.2.2
           curl -sS -I --max-time 20 https://example.com | head -1

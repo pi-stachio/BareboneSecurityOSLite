@@ -22,10 +22,21 @@ qemu-system-x86_64 -enable-kvm -m 2048 \
     -drive file=lfs-13.0-sysv.qcow2,format=qcow2 -nographic
 ```
 
-Log in as **`root`** / **`lfs`**. `poweroff` shuts it down; `Ctrl-a` then `x` detaches.
+Log in as **`root`** / **`lfs`**, or as **`admin`** / **`lfs`** (in the `wheel` group, so
+`sudo` works). `poweroff` shuts it down; `Ctrl-a` then `x` detaches.
 
-It's a 12 GB virtual disk that compresses to ~489 MB. Works in Hyper-V and VirtualBox too
-(convert with `qemu-img convert`).
+To reach it over the network instead, forward a port and SSH in — root login is disabled,
+so use the `admin` account:
+
+```bash
+qemu-system-x86_64 -enable-kvm -m 2048 \
+    -drive file=lfs-13.0-sysv.qcow2,format=qcow2 \
+    -netdev user,id=n0,hostfwd=tcp::2222-:22 -device e1000,netdev=n0 -display none &
+ssh -p 2222 admin@localhost
+```
+
+It's a 12 GB virtual disk that compresses to ~506 MB. Works in Hyper-V and VirtualBox too
+(convert with `qemu-img convert`). eth0 uses DHCP, so it gets an address on any network.
 
 ## Build it yourself
 
@@ -52,10 +63,11 @@ automation, which reads the book's XML and runs the book's commands — so this 
 reimplementation of LFS, it's LFS. `07-run-build.sh` is resumable: it stamps each completed
 target, so re-running continues from a failure rather than restarting.
 
-### Optional: make it administrable
+### The administrable layer
 
-The base LFS system has no `ping`, no `ssh`, no `sudo` and no TLS trust store. Two more
-scripts add a minimal, useful set from BLFS:
+A pure LFS system has no `ping`, no `ssh`, no `sudo` and no TLS trust store — it can
+compile anything but you can't log into it remotely or verify a certificate. Two more
+scripts add a minimal, useful set from BLFS (already included in the released image):
 
 ```bash
 bash scripts/10-blfs-sources.sh   # md5-verified against the BLFS book
@@ -129,6 +141,15 @@ like `.co.uk`). Build `libunistring` → `libidn2` → `libpsl` instead.
 **Mirror checksum lists are not interchangeable.** The `md5sums` on the package mirror is the
 *systemd* list; five SysV-only packages are simply absent from it. Verify against the book's
 own checksums, not the mirror's.
+
+**`ping` needs a capability that meson's install doesn't grant.** Fresh out of the build it
+fails for non-root users with `missing cap_net_raw+p capability or setuid?`. Grant just that
+one capability — `setcap cap_net_raw+p /usr/bin/ping` — rather than making it setuid root.
+`rsync -aHAX` preserves it when copying into the disk image; plain `rsync -a` would not.
+
+**QEMU's `hostfwd` accepts TCP connections whether or not the guest is listening.** So
+"wait until the port is open" is not a readiness check — it succeeds within seconds of
+starting QEMU and you then connect to nothing. Probe with a real SSH handshake instead.
 
 ## Credits
 
