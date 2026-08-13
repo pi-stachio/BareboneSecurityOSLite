@@ -1,0 +1,15 @@
+# Bootable OS images — far over GitHub's 100 MB file limit; published as Release assets.
+image/
+*.img
+*.qcow2
+
+# The LFS book itself is third-party content (Creative Commons BY-NC-SA), so it is not
+# redistributed here. Regenerate it locally with scripts/render-book.sh.
+book/
+book-commands/
+
+# Stale duplicate of an older README
+ForClaudeREADME.md
+
+# Build logs and scratch
+*.log
