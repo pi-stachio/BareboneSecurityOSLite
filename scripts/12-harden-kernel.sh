@@ -30,6 +30,20 @@ cat > "$LFS/sources/harden-kernel-inside.sh" <<'EOS'
 #!/bin/bash
 set -e
 KVER=6.18.10
+
+# Stand the hardened userland specs down for the kernel build (see 16-harden-toolchain.sh).
+# The kernel supplies its own -fno-PIE, -fcf-protection=none and stack-protector flags and
+# an explicit command-line flag does beat -fhardened -- but a blanket -fno-hardened does
+# NOT, because self_spec is applied after the command line. There is no way to opt out
+# from the kernel's Makefile, so the specs file is moved aside instead. The trap puts it
+# back even if the build fails, so a failed kernel cannot silently unharden userland.
+SPECS=$(dirname "$(gcc -print-libgcc-file-name)")/specs
+if [ -f "$SPECS" ]; then
+    mv "$SPECS" "$SPECS.disabled"
+    trap 'mv -f "$SPECS.disabled" "$SPECS" 2>/dev/null || true' EXIT
+    echo "### userland hardening specs stood down for the kernel build ###"
+fi
+
 cd /sources
 [ -d "linux-$KVER" ] || tar -xf "linux-$KVER.tar.xz"
 cd "linux-$KVER"

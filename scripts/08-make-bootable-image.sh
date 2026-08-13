@@ -17,7 +17,7 @@ IMG=${DISK_IMG:-/lfs-disk.img}
 SIZE=${1:-12G}
 MNT=/mnt/target
 ROOTPW=${ROOTPW:-lfs}
-HOSTNAME=${HOSTNAME_LFS:-lfs}
+HOSTNAME=${HOSTNAME_LFS:-bastion}
 ADMINUSER=${ADMINUSER:-admin}
 
 mountpoint -q "$LFS" || { echo "FATAL: $LFS not mounted"; exit 1; }
@@ -86,7 +86,7 @@ set timeout=3
 insmod part_msdos
 insmod ext2
 
-menuentry "Barebone LFS 13.0 (SysV), Linux $KERNEL" {
+menuentry "BastionOS (LFS 13.0 SysV), Linux $KERNEL" {
     set root=(hd0,msdos1)
     linux /boot/$KERNEL root=/dev/sda1 ro console=tty0 console=ttyS0,115200 net.ifnames=0 lockdown=integrity
 }

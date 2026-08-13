@@ -78,7 +78,7 @@ SSHD="$LFS/etc/ssh/sshd_config"
 sed -i -E '/^[[:space:]]*#?[[:space:]]*(PermitRootLogin|PasswordAuthentication|KbdInteractiveAuthentication|PermitEmptyPasswords|X11Forwarding|AllowTcpForwarding|AllowAgentForwarding|MaxAuthTries|LoginGraceTime|ClientAliveInterval|ClientAliveCountMax|AllowGroups)\b/d' "$SSHD"
 cat >> "$SSHD" <<'EOF'
 
-# --- BareboneSecurityOSLite hardening ---------------------------------------
+# --- BastionOS hardening -----------------------------------------------------
 PermitRootLogin no
 PasswordAuthentication no          # key-based auth only over the network
 KbdInteractiveAuthentication no
@@ -98,11 +98,40 @@ EOF
 echo "==> password and umask defaults"
 LD="$LFS/etc/login.defs"
 if [ -f "$LD" ]; then
-    sed -i -E 's/^[[:space:]]*#?[[:space:]]*UMASK.*/UMASK 027/' "$LD"
-    sed -i -E 's/^[[:space:]]*#?[[:space:]]*ENCRYPT_METHOD.*/ENCRYPT_METHOD SHA512/' "$LD"
-    grep -q '^SHA_CRYPT_MIN_ROUNDS' "$LD" || echo 'SHA_CRYPT_MIN_ROUNDS 65536' >> "$LD"
-    grep -q '^UMASK' "$LD" || echo 'UMASK 027' >> "$LD"
-    grep -q '^ENCRYPT_METHOD' "$LD" || echo 'ENCRYPT_METHOD SHA512' >> "$LD"
+    # Prefer yescrypt over SHA512. LFS builds shadow with --with-yescrypt and sets it as
+    # the default, and it is the stronger choice -- memory-hard, so it resists GPU and
+    # ASIC cracking in a way SHA512-crypt does not. Forcing SHA512 "for hardening" would
+    # be a downgrade. Fall back only if libcrypt was built without it.
+    if grep -qa yescrypt "$LFS"/usr/lib/libcrypt.so.* 2>/dev/null; then
+        METHOD=YESCRYPT
+    else
+        METHOD=SHA512
+    fi
+    echo "    password hashing: $METHOD"
+    # Delete every existing copy of these keys -- commented or not -- then append one
+    # authoritative block, the same way the sshd_config edit above works.
+    #
+    # A plain s/// substitution is wrong here: login.defs ships a commented example
+    # alongside the real setting, so the pattern matches twice and you end up with two
+    # active "UMASK 027" lines. shadow itself tolerates that, but the file is then
+    # self-contradictory to read and anything parsing it sees the value twice --
+    # which is exactly how this surfaced, as a umask of "027\n027" in the audit.
+    sed -i -E '/^[[:space:]]*#?[[:space:]]*(UMASK|ENCRYPT_METHOD|SHA_CRYPT_MIN_ROUNDS|YESCRYPT_COST_FACTOR)\b/d' "$LD"
+    {
+        echo "UMASK 027"
+        echo "ENCRYPT_METHOD $METHOD"
+        if [ "$METHOD" = YESCRYPT ]; then
+            echo "YESCRYPT_COST_FACTOR 7"
+        else
+            echo "SHA_CRYPT_MIN_ROUNDS 65536"
+        fi
+    } >> "$LD"
+    # Prove there is exactly one of each.
+    for k in UMASK ENCRYPT_METHOD; do
+        c=$(grep -c "^$k " "$LD")
+        [ "$c" = 1 ] || { echo "ERROR: $k appears $c times in login.defs"; exit 1; }
+    done
+    grep -E '^(UMASK|ENCRYPT_METHOD|YESCRYPT_COST_FACTOR|SHA_CRYPT_MIN_ROUNDS) ' "$LD" | sed 's/^/    /'
 fi
 
 echo

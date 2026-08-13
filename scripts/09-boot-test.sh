@@ -88,7 +88,7 @@ ck 'Freeing unused kernel image'  "$LOG"    'kernel handed off to userland'
 ck 'login:'                       "$LOG"    'reached a login prompt'
 ck 'Starting SSH Server|sshd'     "$LOG"    'sshd started at boot'
 [ "$up" = 1 ] && echo "OK:    sshd accepted a TCP connection" || { echo "ERROR: sshd unreachable"; fail=1; }
-ck '^lfs$'                        "$SSHLOG" 'logged in over SSH (hostname)'
+ck '^bastion$'                    "$SSHLOG" 'logged in over SSH (hostname)'
 ck 'groups=.*wheel'               "$SSHLOG" 'admin is in the wheel group'
 ck 'inet 10\.0\.2\.[0-9]+'        "$SSHLOG" 'eth0 got an address from DHCP'
 ck '2 (packets )?received|2 received' "$SSHLOG" 'ping works (iputils)'
@@ -101,6 +101,13 @@ ck 'yama active'                  "$SSHLOG" 'yama LSM active'
 ck 'lockdown active'              "$SSHLOG" 'lockdown LSM active'
 ck 'no loadable modules present'  "$SSHLOG" 'kernel has no loadable modules'
 ck 'inbound policy is drop'       "$SSHLOG" 'firewall default-denies inbound'
+# Toolchain tier. Anchored on 100% rather than on the word "OK" so that a partial
+# rebuild -- the failure mode this tier actually has -- cannot pass silently.
+ck 'full RELRO \(BIND_NOW\).*100%'     "$SSHLOG" 'every binary has full RELRO'
+ck 'PIE \(executables\).*100%'         "$SSHLOG" 'every executable is PIE'
+ck 'newly compiled binaries get BIND_NOW' "$SSHLOG" 'the shipped compiler still hardens'
+ck '_FORTIFY_SOURCE=3 is the default'  "$SSHLOG" 'fortify is the compiler default'
+ck 'password hashing is yescrypt'      "$SSHLOG" 'yescrypt password hashing'
 if grep -qE '^ *[0-9]+ passed, [0-9]+ warnings, 0 failures' "$SSHLOG"; then
     printf 'OK:    %s\n' 'security audit reports no failures'
 else

@@ -1,14 +1,17 @@
-# BareboneSecurityOSLite
+# BastionOS
 
-A complete **Linux From Scratch 13.0** system — compiled from source, bootable, and
+A hardened **Linux From Scratch 13.0** system — compiled from source, bootable, and
 reproducible from a single set of scripts on a Windows machine via WSL2.
 
 No distro packages. No installer. Every binary in the running system was compiled locally
-from upstream source, starting from a cross-toolchain built by hand.
+from upstream source, starting from a cross-toolchain built by hand — then compiled a
+second time with a hardened compiler.
 
 ```
 LFS 13.0 (SysV) · x86_64 · kernel 6.18.10 · gcc 15.2.0 · glibc 2.43 · binutils 2.46
 651 binaries · 1.5 GB installed · GRUB on MBR · boots in QEMU, Hyper-V or VirtualBox
+KASLR · Landlock/Yama/lockdown · no loadable modules · nftables default-deny
+full RELRO · PIE · _FORTIFY_SOURCE=3 · CET · stack-clash protection, system-wide
 ```
 
 ---
@@ -19,24 +22,40 @@ Grab the disk image from [Releases](../../releases), then:
 
 ```bash
 qemu-system-x86_64 -enable-kvm -m 2048 \
-    -drive file=lfs-13.0-sysv.qcow2,format=qcow2 -nographic
+    -drive file=bastionos-1.3.0-x86_64.qcow2,format=qcow2 -nographic
 ```
 
-Log in as **`root`** / **`lfs`**, or as **`admin`** / **`lfs`** (in the `wheel` group, so
-`sudo` works). `poweroff` shuts it down; `Ctrl-a` then `x` detaches.
+The system comes up as **`bastion`**. Log in as **`root`** / **`lfs`**, or as **`admin`** /
+**`lfs`** (in the `wheel` group, so `sudo` works). `poweroff` shuts it down; `Ctrl-a` then
+`x` detaches. Change both passwords before putting this anywhere real — they are
+deliberately trivial so the image is useful to experiment with out of the box.
 
 To reach it over the network instead, forward a port and SSH in — root login is disabled,
 so use the `admin` account:
 
 ```bash
 qemu-system-x86_64 -enable-kvm -m 2048 \
-    -drive file=lfs-13.0-sysv.qcow2,format=qcow2 \
+    -drive file=bastionos-1.3.0-x86_64.qcow2,format=qcow2 \
     -netdev user,id=n0,hostfwd=tcp::2222-:22 -device e1000,netdev=n0 -display none &
 ssh -p 2222 admin@localhost
 ```
 
-It's a 12 GB virtual disk that compresses to ~506 MB. Works in Hyper-V and VirtualBox too
+It's a 12 GB virtual disk that compresses to ~530 MB. Works in Hyper-V and VirtualBox too
 (convert with `qemu-img convert`). eth0 uses DHCP, so it gets an address on any network.
+
+Once inside, `sudo security-audit` reports what is actually true of the running system:
+
+```
+ELF hardening across the whole installed system
+    scanned 697 files (690 dynamic, 7 static)
+    full RELRO (BIND_NOW)     690/690  100%
+    PIE (executables)         580/580  100%
+    non-executable stack      690/690  100%
+    CET (IBT+SHSTK)           690/690  100%
+    stack canary              646/690   93%   (only where the code has a protectable frame)
+
+  57 passed, 0 warnings, 0 failures
+```
 
 ## Build it yourself
 
@@ -63,6 +82,12 @@ automation, which reads the book's XML and runs the book's commands — so this 
 reimplementation of LFS, it's LFS. `07-run-build.sh` is resumable: it stamps each completed
 target, so re-running continues from a failure rather than restarting.
 
+The hardened rebuild in `17-rebuild-userland.sh` re-executes those same extracted commands
+against the modified compiler, so it inherits the book rather than forking it. Measured
+cost on this machine: **2.8× the original wall time** for chapter 8 (2 h 25 m). Most of
+that is I/O, not codegen — `man-pages`, which compiles nothing at all and only copies
+files, still took 5.8× longer, while compile-bound gcc took 1.8×.
+
 ### The hardening layer
 
 ```bash
@@ -70,22 +95,33 @@ bash scripts/12-harden-kernel.sh         # hardened kernel, no loadable modules
 bash scripts/13-firewall.sh              # nftables, default-deny inbound
 bash scripts/14-harden-config.sh         # sysctl, sshd, umask, SUID trim
 bash scripts/15-rebuild-gmp-portable.sh  # remove build-CPU tuning from GMP
+bash scripts/16-harden-toolchain.sh      # make gcc emit hardened code by default
+bash scripts/17-rebuild-userland.sh      # rebuild all of chapter 8 with it (~3 h)
 bash scripts/08-make-bootable-image.sh   # fold into a new image
 ```
 
-The kernel gets KASLR, hardened usercopy, `INIT_ON_ALLOC`/`INIT_ON_FREE`, slab freelist
+**The kernel** gets KASLR, hardened usercopy, `INIT_ON_ALLOC`/`INIT_ON_FREE`, slab freelist
 hardening and randomised kmalloc caches, plus **Landlock, Yama and lockdown** as LSMs.
 Loadable module support is compiled out entirely, along with `/dev/mem`, `/proc/kcore`,
 kexec, hibernation and 32-bit syscall emulation.
 
-Userspace gets a default-deny nftables ruleset that loads *before* the network comes up,
-a hardened sysctl set, key-only SSH restricted to the `wheel` group, and a SUID trim from
-11 binaries to 8 — with `ping`, `ping6` and `traceroute` moved from setuid-root to a
-`cap_net_raw` capability.
+**The configuration** gets a default-deny nftables ruleset that loads *before* the network
+comes up, a hardened sysctl set, key-only SSH restricted to the `wheel` group, yescrypt
+password hashing, and a SUID trim from 11 binaries to 8 — with `ping`, `ping6` and
+`traceroute` moved from setuid-root to a `cap_net_raw` capability.
 
-Run `security-audit` on the running system to check all of it. It reports honestly,
-including the ELF hardening that is **not** yet applied — full RELRO and PIE across every
-package needs the toolchain rebuild, which this project has not done yet.
+**The toolchain** tier is the one that touches every binary in the system. Rather than
+setting `CFLAGS` — which only works for packages that bother to honour it — the flags go
+into a GCC **specs file**, so a package would have to actively fight the compiler to opt
+out. Every chapter 8 package is then rebuilt with it, using the book's own commands that
+jhalfs already extracted. That gives `_FORTIFY_SOURCE=3`, `-fstack-clash-protection`,
+`-fcf-protection=full` (CET), `_GLIBCXX_ASSERTIONS`, `-ftrivial-auto-var-init=zero`, and
+full RELRO with `BIND_NOW` on executables *and* shared libraries. PIE and stack-protector
+were already LFS defaults.
+
+Run `security-audit` on the running system to check all of it. It scans every binary and
+library rather than a sample, names any outliers, and re-checks the shipped compiler by
+compiling a program with it.
 
 ### The administrable layer
 
@@ -119,6 +155,13 @@ Root SSH login stays disabled.
 | `08-make-bootable-image.sh` | Partitioned image, GRUB, hostname, getty, password |
 | `09-boot-test.sh` | Boot in QEMU and verify over SSH |
 | `10-blfs-sources.sh` / `11-blfs-build.sh` | The optional admin toolset |
+| `12-harden-kernel.sh` | Hardened kernel: mitigations on, modules and legacy interfaces off |
+| `13-firewall.sh` | nftables with a default-deny inbound ruleset |
+| `14-harden-config.sh` | sysctl, sshd, password and umask policy, SUID trim |
+| `15-rebuild-gmp-portable.sh` | Rebuild GMP without build-CPU tuning |
+| `16-harden-toolchain.sh` | Hardened GCC specs (`full`/`no-fortify`/`link-only`/`off`) |
+| `17-rebuild-userland.sh` | Rebuild every chapter 8 package with it — resumable |
+| `security-audit.sh` | Installed as `/usr/sbin/security-audit` on the image |
 | `render-book.sh` | Render the LFS book locally from its GitHub mirror |
 | `run-lfs.sh` / `run-lfs-gui.sh` | Boot the finished system, text or windowed |
 | `watch-build.sh` / `watch-blfs.sh` | Progress and failure watchers |
@@ -195,6 +238,39 @@ vanishes rather than becoming built-in. Anything you actually need (here: all th
 symbols) has to be forced to `=y` explicitly, or you get a kernel with no firewall support
 and no error message saying so.
 
+**`-fhardened` does not harden shared libraries.** It drops its own link hardening whenever
+any other link option is on the command line — and `-shared` is one, so *every* `.so` in the
+system comes out with lazy binding while executables look perfect. Since closing exactly
+that gap is the point of the exercise, the `-z relro -z now` has to go into the `*link:`
+spec separately. The give-away is that `readelf -d` on a library shows no `BIND_NOW` even
+though the compiler claims to be applying it.
+
+**GCC specs files need exactly one blank line between specs, and the error never says so.**
+Two blank lines gets you `specs file malformed after N characters`, pointing at a byte
+offset in a 10 KB file. Zero blank lines is worse: the new spec is quietly absorbed into
+the *previous* one, and the first thing you hear about it is
+`gcc: fatal error: cannot execute '*self_spec:': No such file or directory` at the next
+link. `gcc -dumpspecs` already ends with that blank line, so append directly to it. Also
+note `-dumpspecs` prints the **effective** specs — dump while your own specs file is
+installed and you get a file with the flags applied twice and a duplicate `*self_spec`, so
+delete it before regenerating.
+
+**CET marking is an intersection, and glibc decides it for the whole system.** The
+`IBT`/`SHSTK` note in `.note.gnu.property` survives only if *every* input object carries
+it, and the linker drops it silently otherwise. glibc supplies `crt1.o`, `crti.o` and
+`crtn.o` to every binary that gets linked, so a glibc built without `-fcf-protection`
+strips CET marking off the entire OS — the `endbr64` instructions are still emitted, they
+are just never enforced, because the loader has nothing telling it to turn CET on. Which is
+the worst outcome: it looks hardened and costs the code size without buying the protection.
+Verify with `readelf -n` on a binary, not by grepping the asm for `endbr64`.
+
+**The book's commands are written to run exactly once.** Six of them use `ln -sv` with no
+`-f`, so on a rebuild the link already exists, `ln` fails, and `set -e` takes the package
+down with it. One of those points at a directory, where `ln -sf` does something worse than
+fail — it cheerfully creates the new link *inside* the old target — so the fix is `ln -sfn`.
+Worth scanning for before starting a multi-hour rebuild rather than discovering them one
+package at a time.
+
 ## Credits
 
 Built and maintained by [**pi-stachio**](https://github.com/pi-stachio).
@@ -202,7 +278,9 @@ Built and maintained by [**pi-stachio**](https://github.com/pi-stachio).
 Standing on the shoulders of the [Linux From Scratch](https://www.linuxfromscratch.org/)
 project — the book, [jhalfs](https://github.com/lfs-book/jhalfs), and BLFS are theirs, and
 this repository is a set of scripts for running their work reproducibly, not a substitute
-for reading it.
+for reading it. BastionOS is not affiliated with or endorsed by the LFS project.
+
+*Previously released as BareboneSecurityOSLite; renamed at v1.3.0.*
 
 ## Licence
 

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Security audit for BareboneSecurityOSLite. Installed as /usr/sbin/security-audit.
+# Security audit for BastionOS. Installed as /usr/sbin/security-audit.
 #
 # Reports what is actually true of the running system rather than what was intended:
 # kernel build options, live sysctl values, active LSMs, the firewall policy, the
@@ -130,26 +130,118 @@ else
     warn "no sshd_config"
 fi
 
-hdr "ELF hardening of installed binaries"
-# Userland compiler flags are the tier this project has not yet applied; report the
-# real state rather than assume it.
-elfchk() {
-    local f=$1 h
-    [ -x "$f" ] || return
-    h=$(readelf -lWd "$f" 2>/dev/null) || return
-    local relro=no now=no pie=no nx=no canary=no
-    grep -q 'GNU_RELRO' <<<"$h" && relro=yes
-    grep -qE 'BIND_NOW|FLAGS.*NOW' <<<"$h" && now=yes
-    readelf -hW "$f" 2>/dev/null | grep -q 'Type:[[:space:]]*DYN' && pie=yes
-    grep -q 'GNU_STACK.*RWE' <<<"$h" || nx=yes
-    readelf -sW "$f" 2>/dev/null | grep -q '__stack_chk_fail' && canary=yes
-    printf '    %-22s relro=%-3s bindnow=%-3s pie=%-3s nx=%-3s canary=%s\n' \
-        "$(basename "$f")" "$relro" "$now" "$pie" "$nx" "$canary"
+hdr "Password and file-creation policy"
+LD=/etc/login.defs
+if [ -r "$LD" ]; then
+    em=$(awk '/^ENCRYPT_METHOD/{print $2}' "$LD")
+    case "$em" in
+        YESCRYPT) ok "password hashing is yescrypt (memory-hard)" ;;
+        SHA512)   warn "password hashing is SHA512 — yescrypt is available and stronger" ;;
+        *)        bad "password hashing is '${em:-unset}'" ;;
+    esac
+    um=$(awk '/^UMASK/{print $2}' "$LD")
+    [ "$um" = 027 ] && ok "default umask 027 (group/other cannot read new files)" \
+                    || warn "default umask is '${um:-unset}', expected 027"
+    # A locked or absent root password is fine; a *blank* one is not.
+    if awk -F: '$1=="root" && $2==""' /etc/shadow 2>/dev/null | grep -q .; then
+        bad "root has an empty password"
+    else
+        ok "root password is not empty"
+    fi
+else
+    warn "no /etc/login.defs"
+fi
+
+hdr "ELF hardening across the whole installed system"
+# Sampling a handful of binaries proves nothing about a rebuild: the interesting question
+# is whether ANY binary was missed. So scan every executable and shared library and
+# report the outliers by name.
+#
+# One readelf call per file carrying every section we need -- headers, program headers,
+# dynamic section, notes, dynamic symbols. Three separate calls over ~700 files is
+# noticeably slow on a VM.
+tmp=$(mktemp); miss_now=$(mktemp); miss_pie=$(mktemp); miss_nx=$(mktemp); miss_cet=$(mktemp)
+tot=0; static=0; n_now=0; n_relro=0; n_nx=0; n_cet=0; n_canary=0; exe=0; n_pie=0
+
+for f in /usr/bin/* /usr/sbin/* /usr/lib/*.so*; do
+    [ -f "$f" ] && [ ! -L "$f" ] || continue
+    # readelf exits non-zero on anything that is not ELF, which filters out the shell
+    # scripts and data files that live alongside the binaries.
+    readelf -W -h -l -d -n --dyn-syms "$f" > "$tmp" 2>/dev/null || continue
+    tot=$((tot+1))
+
+    # No dynamic section at all -- a static binary. It cannot have BIND_NOW, and saying
+    # it "fails" full RELRO would be a false positive, so count it separately.
+    if ! grep -q 'Dynamic section at offset' "$tmp"; then static=$((static+1)); continue; fi
+
+    grep -q 'GNU_RELRO' "$tmp" && n_relro=$((n_relro+1))
+    if grep -qE 'BIND_NOW|FLAGS.*\bNOW\b' "$tmp"; then n_now=$((n_now+1))
+    else echo "$f" >> "$miss_now"; fi
+    if grep -q 'GNU_STACK' "$tmp" && grep -qE 'GNU_STACK.*RWE' "$tmp"; then echo "$f" >> "$miss_nx"
+    else n_nx=$((n_nx+1)); fi
+    grep -q '__stack_chk_fail' "$tmp" && n_canary=$((n_canary+1))
+    # Match the .note.gnu.property line specifically, and require both properties --
+    # a bare grep for IBT would also hit any symbol name containing those letters.
+    if grep 'x86 feature:' "$tmp" | grep -q 'IBT' && grep 'x86 feature:' "$tmp" | grep -q 'SHSTK'
+    then n_cet=$((n_cet+1)); else echo "$f" >> "$miss_cet"; fi
+
+    # PIE only means something for executables; a shared library is DYN by definition.
+    case "$f" in /usr/lib/*.so*) ;; *)
+        exe=$((exe+1))
+        if grep -qE 'Type:[[:space:]]+DYN' "$tmp"; then n_pie=$((n_pie+1))
+        else echo "$f" >> "$miss_pie"; fi ;;
+    esac
+done
+
+pct() { [ "$2" -eq 0 ] && echo 0 || echo $(( $1 * 100 / $2 )); }
+show_missing() { # file label
+    [ -s "$1" ] || return
+    echo "    missing $2:"; sed 's|^|      |' "$1" | head -8
+    [ "$(wc -l < "$1")" -gt 8 ] && echo "      ... and $(( $(wc -l < "$1") - 8 )) more"
 }
-for f in /usr/bin/bash /usr/bin/ls /usr/bin/sudo /usr/bin/ssh /usr/bin/curl \
-         /usr/sbin/sshd /usr/sbin/nft; do elfchk "$f"; done
-echo "    (full RELRO + PIE across all packages requires rebuilding with hardened"
-echo "     CFLAGS — the toolchain tier, not yet applied)"
+dyn=$((tot-static))
+echo "    scanned $tot files ($dyn dynamic, $static static)"
+
+rate() { # label count total threshold-pct missingfile
+    local p; p=$(pct "$2" "$3")
+    printf '    %-24s %4d/%-4d %3d%%\n' "$1" "$2" "$3" "$p"
+    if [ "$p" -ge "$4" ]; then PASS=$((PASS+1)); else
+        if [ "$p" -ge $(( $4 - 10 )) ]; then warn "$1 at ${p}% (want ${4}%+)"
+        else bad "$1 at ${p}% (want ${4}%+)"; fi
+        show_missing "$5" "$1"
+    fi
+}
+rate "full RELRO (BIND_NOW)" "$n_now"    "$dyn" 100 "$miss_now"
+rate "GNU_RELRO segment"     "$n_relro"  "$dyn" 100 /dev/null
+rate "PIE (executables)"     "$n_pie"    "$exe" 100 "$miss_pie"
+rate "non-executable stack"  "$n_nx"     "$dyn" 100 "$miss_nx"
+rate "CET (IBT+SHSTK)"       "$n_cet"    "$dyn"  95 "$miss_cet"
+printf '    %-24s %4d/%-4d %3d%%   (only where the code has a protectable frame)\n' \
+    "stack canary" "$n_canary" "$dyn" "$(pct "$n_canary" "$dyn")"
+rm -f "$tmp" "$miss_now" "$miss_pie" "$miss_nx" "$miss_cet"
+
+hdr "Compiler defaults on the running system"
+# The image ships a working toolchain, so anything built ON this system should inherit
+# the same hardening. Verify against a real compile rather than trusting the specs file.
+if command -v gcc > /dev/null; then
+    GCCSPECS=$(dirname "$(gcc -print-libgcc-file-name 2>/dev/null)")/specs
+    [ -f "$GCCSPECS" ] && ok "hardened specs installed" || bad "no specs file at $GCCSPECS"
+    t=$(mktemp -d); printf 'int main(void){return 0;}\n' > "$t/t.c"
+    if gcc -O2 "$t/t.c" -o "$t/t" 2>/dev/null; then
+        readelf -dW "$t/t" | grep -qE 'BIND_NOW|FLAGS.*\bNOW\b' \
+            && ok "newly compiled binaries get BIND_NOW" \
+            || bad "newly compiled binaries lack BIND_NOW"
+        [ "$(gcc -O2 -dM -E - < /dev/null | awk '/define _FORTIFY_SOURCE/{print $3}')" = 3 ] \
+            && ok "_FORTIFY_SOURCE=3 is the default" || bad "_FORTIFY_SOURCE=3 is not default"
+        [ "$(gcc -O2 -dM -E - < /dev/null | awk '/define __CET__/{print $3}')" = 3 ] \
+            && ok "CET is on by default" || bad "CET is not on by default"
+    else
+        bad "the shipped gcc cannot compile a trivial program"
+    fi
+    rm -rf "$t"
+else
+    warn "no gcc on this system to check"
+fi
 
 hdr "Summary"
 printf '  %d passed, %d warnings, %d failures\n' "$PASS" "$WARN" "$FAIL"

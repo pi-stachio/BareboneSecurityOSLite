@@ -99,7 +99,7 @@ cat > "$LFS/etc/rc.d/init.d/nftables" <<'EOF'
 # Default-Stop:        0 1 2 6
 # Short-Description:   Loads the nftables firewall ruleset
 # Description:         Applies /etc/nftables.conf, a default-deny inbound policy.
-# X-LFS-Provided-By:   BareboneSecurityOSLite
+# X-LFS-Provided-By:   BastionOS
 ### END INIT INFO
 . /lib/lsb/init-functions
 
