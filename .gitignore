@@ -8,8 +8,5 @@ image/
 book/
 book-commands/
 
-# Stale duplicate of an older README
-ForClaudeREADME.md
-
 # Build logs and scratch
 *.log
