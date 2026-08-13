@@ -141,6 +141,7 @@ for reading it.
 
 ## Licence
 
-Not yet chosen — until one is added, default copyright applies and reuse rights are
-reserved. The scripts here are original; the LFS book and package sources they fetch carry
-their own separate licences.
+[MIT](LICENSE) — the scripts in this repository are original work and free to reuse.
+
+This covers the scripts only. The LFS book, jhalfs, and every package these scripts
+download carry their own separate licences, and the built system is a composite of them.
