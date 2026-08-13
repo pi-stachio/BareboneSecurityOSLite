@@ -7,15 +7,20 @@
 set -euo pipefail
 
 IMG=${DISK_IMG:-/lfs-disk.img}
+PORT=${SSH_PORT:-2222}
 [ -f "$IMG" ] || { echo "FATAL: $IMG not found"; exit 1; }
 [ -n "${DISPLAY:-}" ] || { echo "FATAL: no DISPLAY; WSLg not available"; exit 1; }
 
 ACCEL=()
 [ -w /dev/kvm ] && ACCEL=(-enable-kvm -cpu host)
 
-echo "Opening a QEMU window (login: root / lfs)"
+echo "Opening a QEMU window"
+echo "  login : root / lfs   or   admin / lfs"
+echo "  ssh   : ssh -p $PORT admin@localhost"
 exec qemu-system-x86_64 \
     "${ACCEL[@]}" \
     -m "${MEM:-2048}" -smp "${CPUS:-2}" \
     -drive file="$IMG",format=raw,if=ide \
+    -netdev user,id=n0,hostfwd=tcp::"$PORT"-:22 \
+    -device e1000,netdev=n0 \
     -display gtk -vga std -no-reboot
