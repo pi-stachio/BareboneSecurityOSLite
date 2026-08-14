@@ -243,6 +243,52 @@ else
     warn "no gcc on this system to check"
 fi
 
+hdr "Known vulnerabilities in installed packages"
+# Read the cached report rather than querying NVD live: the scan is rate limited to
+# several minutes, and an audit that needs the network to finish is an audit that gets
+# skipped. /usr/sbin/vuln-scan refreshes it.
+VR=/etc/bastionos/vuln-report.txt
+if [ -r "$VR" ]; then
+    gen=$(awk '/^# generated:/{print $3}' "$VR")
+    sm=$(grep -m1 '^SUMMARY' "$VR")
+    crit=$(sed -n 's/.*critical=\([0-9]*\).*/\1/p' <<<"$sm")
+    high=$(sed -n 's/.*high=\([0-9]*\).*/\1/p' <<<"$sm")
+    med=$(sed -n 's/.*medium=\([0-9]*\).*/\1/p' <<<"$sm")
+    low=$(sed -n 's/.*low=\([0-9]*\).*/\1/p' <<<"$sm")
+    aff=$(sed -n 's/.*affected_packages=\([0-9]*\).*/\1/p' <<<"$sm")
+    scanned=$(sed -n 's/.*scanned=\([0-9]*\).*/\1/p' <<<"$sm")
+    echo "    report generated $gen  ($scanned packages scanned)"
+    printf '    critical=%s high=%s medium=%s low=%s   across %s packages\n' \
+        "${crit:-?}" "${high:-?}" "${med:-?}" "${low:-?}" "${aff:-?}"
+
+    # Age: upstream publishes new advisories constantly, so a stale report is a
+    # statement about the past, not the present.
+    if [ -n "$gen" ] && age=$(( ( $(date -u +%s) - $(date -u -d "$gen" +%s) ) / 86400 )) 2>/dev/null; then
+        if [ "$age" -le 30 ]; then ok "vulnerability report is ${age}d old"
+        else warn "vulnerability report is ${age}d old — run vuln-scan to refresh"; fi
+    fi
+
+    # These are upstream facts about pinned versions, not defects in how this system was
+    # built or configured, so they are warnings rather than failures. Reporting them as
+    # failures would also mean the boot test could never pass, which would train everyone
+    # to ignore it.
+    if [ "${crit:-0}" -gt 0 ]; then warn "$crit critical advisories affect installed packages"
+    else ok "no critical advisories"; fi
+    if [ "${high:-0}" -gt 0 ]; then warn "$high high-severity advisories affect installed packages"
+    else ok "no high-severity advisories"; fi
+
+    echo "    worst-affected packages:"
+    grep '^PKG' "$VR" | awk -F'\t' '{
+        c=$5; sub(/.*critical=/,"",c); sub(/ .*/,"",c);
+        h=$5; sub(/.*high=/,"",h);     sub(/ .*/,"",h);
+        printf "%d\t%s\t%s\t%s\t%s\n", c*100+h, $2, $3, c, h }' \
+        | sort -rn | head -6 \
+        | awk -F'\t' '{printf "      %-18s %-12s critical=%s high=%s\n", $2, $3, $4, $5}'
+    echo "    full list: $VR   refresh: vuln-scan"
+else
+    warn "no vulnerability report at $VR — run vuln-scan"
+fi
+
 hdr "Summary"
 printf '  %d passed, %d warnings, %d failures\n' "$PASS" "$WARN" "$FAIL"
 [ "$FAIL" -eq 0 ] && echo "  No failures." || echo "  Review the failures above."

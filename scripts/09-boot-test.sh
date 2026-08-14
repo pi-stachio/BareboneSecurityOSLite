@@ -108,6 +108,10 @@ ck 'PIE \(executables\).*100%'         "$SSHLOG" 'every executable is PIE'
 ck 'newly compiled binaries get BIND_NOW' "$SSHLOG" 'the shipped compiler still hardens'
 ck '_FORTIFY_SOURCE=3 is the default'  "$SSHLOG" 'fortify is the compiler default'
 ck 'password hashing is yescrypt'      "$SSHLOG" 'yescrypt password hashing'
+# The image must carry a vulnerability report. Its *contents* are upstream facts and are
+# not asserted here -- only that the system can tell you what it knows it is running.
+ck 'report generated [0-9]{4}-'        "$SSHLOG" 'vulnerability report present'
+ck 'vulnerability report is [0-9]+d old' "$SSHLOG" 'vulnerability report is current'
 if grep -qE '^ *[0-9]+ passed, [0-9]+ warnings, 0 failures' "$SSHLOG"; then
     printf 'OK:    %s\n' 'security audit reports no failures'
 else

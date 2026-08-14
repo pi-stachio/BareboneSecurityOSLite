@@ -22,7 +22,7 @@ Grab the disk image from [Releases](../../releases), then:
 
 ```bash
 qemu-system-x86_64 -enable-kvm -m 2048 \
-    -drive file=bastionos-1.3.0-x86_64.qcow2,format=qcow2 -nographic
+    -drive file=bastionos-1.3.1-x86_64.qcow2,format=qcow2 -nographic
 ```
 
 The system comes up as **`bastion`**. Log in as **`root`** / **`lfs`**, or as **`admin`** /
@@ -35,7 +35,7 @@ so use the `admin` account:
 
 ```bash
 qemu-system-x86_64 -enable-kvm -m 2048 \
-    -drive file=bastionos-1.3.0-x86_64.qcow2,format=qcow2 \
+    -drive file=bastionos-1.3.1-x86_64.qcow2,format=qcow2 \
     -netdev user,id=n0,hostfwd=tcp::2222-:22 -device e1000,netdev=n0 -display none &
 ssh -p 2222 admin@localhost
 ```
@@ -123,6 +123,71 @@ Run `security-audit` on the running system to check all of it. It scans every bi
 library rather than a sample, names any outliers, and re-checks the shipped compiler by
 compiling a program with it.
 
+### Knowing what you're running
+
+Everything above is about how the system was *built*. It says nothing about whether the
+versions it pins are known to be broken — and a source-built system has no package
+manager, so it has no patch notifications either. Left there, the honest answer to "is
+anything in here vulnerable?" is *nobody knows*.
+
+```bash
+bash scripts/18-vuln-scan.sh          # inventory + check against NVD
+```
+
+This builds a manifest of every installed package from the book commands that actually
+built them, checks each version against the [NVD](https://nvd.nist.gov/) CVE database,
+and ships the result inside the image:
+
+```
+/etc/bastionos/packages.tsv     what is installed
+/etc/bastionos/vuln-report.txt  what is known about it, and when that was checked
+/usr/sbin/vuln-scan             refresh it (needs network)
+```
+
+`security-audit` summarises the cached report and warns when it goes stale, rather than
+querying the network itself — an audit that needs the internet to finish is an audit that
+gets skipped.
+
+Two things this deliberately does *not* do. It does not treat advisories as failures:
+they are upstream facts about pinned versions, not defects in this build, and failing on
+them would mean the boot test could never pass. And it does not claim the CVEs are
+exploitable here — the kernel figure in particular covers drivers and subsystems this
+build does not compile in, so read it as an upper bound.
+
+**What it currently finds**, against the versions LFS 13.0 pins:
+
+```
+critical=17 high=48 medium=68 low=13    20 of 94 packages affected
+
+curl      8.18.0   crit=8  high=12      openssh  10.2p1   crit=0  high=2
+perl      5.42.0   crit=3  high=1       Python   3.14.3   crit=0  high=3
+openssl   3.6.1    crit=2  high=16      dhcpcd   10.3.0   crit=0  high=1
+inetutils 2.7      crit=2  high=1       vim      9.2.0078 crit=1  high=7
+glibc     2.43     crit=1  high=5
+```
+
+Published as found. A release whose whole point is that the system can tell you what it's
+running would be a poor place to start hiding things.
+
+#### On trusting the numbers
+
+NVD's `cpeName` parameter needs the exact CPE vendor, which is often not the obvious one —
+curl's is `haxx`, and querying `curl:curl` returns zero results rather than an error, so a
+naive scanner reports a clean bill of health. Using a wildcard vendor fixes that but
+introduces the opposite problem: product names are not unique across vendors, and the
+collisions are not subtle.
+
+An unfiltered scan of this system reports 18 advisories against `tar`, of which **one** is
+GNU tar — the other 17 are the `node-tar` npm package. `zlib` matches Cloudflare's fork and
+Ruby's binding but not zlib itself. `ninja` matches an unrelated ITRS Group product. Left
+alone, about a quarter of the high-severity count is software that isn't installed.
+
+So `vuln-scan.py` carries a verified vendor allow-list, discards non-matching advisories
+(27 of them here), and reports anything it *can't* disambiguate as UNVERIFIED rather than
+guessing in either direction. The same class of error bites the manifest: LFS builds udev
+from the systemd tarball, so taking the tarball name at face value reports a `systemd` that
+isn't installed — there is no `systemctl` here and there are no units.
+
 ### The administrable layer
 
 A pure LFS system has no `ping`, no `ssh`, no `sudo` and no TLS trust store — it can
@@ -161,6 +226,7 @@ Root SSH login stays disabled.
 | `15-rebuild-gmp-portable.sh` | Rebuild GMP without build-CPU tuning |
 | `16-harden-toolchain.sh` | Hardened GCC specs (`full`/`no-fortify`/`link-only`/`off`) |
 | `17-rebuild-userland.sh` | Rebuild every chapter 8 package with it — resumable |
+| `18-vuln-scan.sh` / `vuln-scan.py` | Inventory packages and check them against NVD |
 | `security-audit.sh` | Installed as `/usr/sbin/security-audit` on the image |
 | `render-book.sh` | Render the LFS book locally from its GitHub mirror |
 | `run-lfs.sh` / `run-lfs-gui.sh` | Boot the finished system, text or windowed |
