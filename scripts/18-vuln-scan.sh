@@ -62,6 +62,18 @@ for t in "$LFS"/sources/blfs/*.tar.*; do
     printf '%s\t%s\t%s\n' "$n" "$v" blfs >> "$tmp"
 done
 
+# Anything installed with bpkg. Without this, software added after the image was built
+# is invisible to the scanner -- and software added later is exactly the software most
+# likely to be unpatched, since the base at least gets rebuilt with the release.
+if [ -d "$LFS/var/lib/bpkg/db" ]; then
+    for p in "$LFS"/var/lib/bpkg/db/*/; do
+        [ -f "$p/PKGINFO" ] || continue
+        n=$(sed -n 's/^name = //p'    "$p/PKGINFO" | head -1)
+        v=$(sed -n 's/^version = //p' "$p/PKGINFO" | head -1)
+        [ -n "$n" ] && [ -n "$v" ] && printf '%s\t%s\t%s\n' "$n" "$v" bpkg >> "$tmp"
+    done
+fi
+
 {
     echo "# BastionOS installed package manifest"
     echo "# name<TAB>version<TAB>origin   -- generated $(date -u +%Y-%m-%dT%H:%M:%SZ)"

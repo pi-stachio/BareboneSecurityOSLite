@@ -22,7 +22,7 @@ Grab the disk image from [Releases](../../releases), then:
 
 ```bash
 qemu-system-x86_64 -enable-kvm -m 2048 \
-    -drive file=bastionos-1.3.1-x86_64.qcow2,format=qcow2 -nographic
+    -drive file=bastionos-1.4.0-x86_64.qcow2,format=qcow2 -nographic
 ```
 
 The system comes up as **`bastion`**. Log in as **`root`** / **`lfs`**, or as **`admin`** /
@@ -30,12 +30,22 @@ The system comes up as **`bastion`**. Log in as **`root`** / **`lfs`**, or as **
 `x` detaches. Change both passwords before putting this anywhere real — they are
 deliberately trivial so the image is useful to experiment with out of the box.
 
+**SSH refuses passwords by design and ships with no authorised key**, so remote login will
+turn you away until you add one from the console:
+
+```
+bastionctl add-key 'ssh-ed25519 AAAA... you@host'
+```
+
+First boot generates this machine's own host keys and prints their fingerprints on the
+console — worth comparing against what `ssh` shows you the first time you connect.
+
 To reach it over the network instead, forward a port and SSH in — root login is disabled,
 so use the `admin` account:
 
 ```bash
 qemu-system-x86_64 -enable-kvm -m 2048 \
-    -drive file=bastionos-1.3.1-x86_64.qcow2,format=qcow2 \
+    -drive file=bastionos-1.4.0-x86_64.qcow2,format=qcow2 \
     -netdev user,id=n0,hostfwd=tcp::2222-:22 -device e1000,netdev=n0 -display none &
 ssh -p 2222 admin@localhost
 ```
@@ -122,6 +132,59 @@ were already LFS defaults.
 Run `security-audit` on the running system to check all of it. It scans every binary and
 library rather than a sample, names any outliers, and re-checks the shipped compiler by
 compiling a program with it.
+
+### Actually using it
+
+A hardened system nobody can log into is not much use. These fix the parts that made a
+downloaded image awkward — or, in one case, impossible — to run:
+
+```bash
+bash scripts/19-firstboot.sh     # first-boot setup + bastionctl
+bash scripts/21-boot-splash.sh   # graphical boot menu, quiet boot, console banner
+bash scripts/22-seed-packages.sh # bpkg + chrony, dcron, log rotation
+```
+
+**First boot** generates this machine's own SSH host keys and prints their fingerprints
+on the console, then grows the root filesystem to fill whatever disk it was given. Both
+matter: up to v1.3.1 the host keys were generated on the *build* machine and baked in, so
+every download shared one host identity and host-key verification — the thing that detects
+a man-in-the-middle — was worth nothing.
+
+**No SSH key is baked into released images** any more either. Earlier releases authorised
+the build machine's key, which meant the image was reachable by whoever built it and, since
+password auth is off, *unreachable over SSH by everyone else*. Access is now provisioned by
+the operator from the console:
+
+```
+bastionctl add-key 'ssh-ed25519 AAAA... you@host'
+bastionctl status        # host, address, firewall, keys, advisories, first-boot state
+bastionctl fingerprints  # compare against what ssh shows you on first connect
+```
+
+`20-package-image.sh` refuses to package an image that still contains an authorised key,
+host keys, or a completed first-boot marker, so that class of mistake cannot ship twice.
+
+**A package manager.** An LFS system can compile anything and install nothing: every
+addition is a manual `make install` that leaves no record, cannot be removed, and silently
+overwrites whatever was there. `bpkg` is deliberately small — a package is a `tar.zst` of a
+filesystem tree plus metadata, the database is a directory of text files, and there is no
+dependency solver, no upgrade transaction and no install-time scriptlets running as root.
+
+```bash
+bpkg install foo-1.0.bpkg     bpkg owns /usr/bin/foo
+bpkg remove foo               bpkg verify          # SHA256 of every installed file
+bpkg list / info / files      bpkg create <dir> <name> <ver>
+```
+
+Two properties were worth more than convenience. Installing **never silently overwrites a
+file owned by another package** — it checks every path before writing anything and aborts
+naming the owner, because on a system with no way to reinstall the base, one careless
+overwrite of libc is unrecoverable. And every file's checksum is recorded, so `bpkg verify`
+detects modification after the fact and `security-audit` reports it.
+
+Three packages ship built with it, each closing a real gap: **chrony** (there was no time
+sync at all, and a drifting clock breaks TLS with errors that blame the certificate),
+**dcron**, and a small **log rotation** job (sysklogd wrote to `/var/log` without bound).
 
 ### Knowing what you're running
 
@@ -227,7 +290,14 @@ Root SSH login stays disabled.
 | `16-harden-toolchain.sh` | Hardened GCC specs (`full`/`no-fortify`/`link-only`/`off`) |
 | `17-rebuild-userland.sh` | Rebuild every chapter 8 package with it — resumable |
 | `18-vuln-scan.sh` / `vuln-scan.py` | Inventory packages and check them against NVD |
+| `19-firstboot.sh` | First-boot service: host keys, rootfs growth, motd |
+| `20-package-image.sh` | Convert to qcow2, refusing to package a test image |
+| `21-boot-splash.sh` / `make-splash.py` | Graphical GRUB menu, quiet boot, console banner |
+| `22-seed-packages.sh` | Build chrony, dcron and log rotation as `bpkg` packages |
+| `bpkg.sh` | The package manager, installed as `/usr/bin/bpkg` |
+| `bastionctl.sh` | Operator helper, installed as `/usr/sbin/bastionctl` |
 | `security-audit.sh` | Installed as `/usr/sbin/security-audit` on the image |
+| `ppm2png.py` | Convert a QEMU screendump for inspection |
 | `render-book.sh` | Render the LFS book locally from its GitHub mirror |
 | `run-lfs.sh` / `run-lfs-gui.sh` | Boot the finished system, text or windowed |
 | `watch-build.sh` / `watch-blfs.sh` | Progress and failure watchers |
@@ -329,6 +399,30 @@ strips CET marking off the entire OS — the `endbr64` instructions are still em
 are just never enforced, because the loader has nothing telling it to turn CET on. Which is
 the worst outcome: it looks hardened and costs the code size without buying the protection.
 Verify with `readelf -n` on a binary, not by grepping the asm for `endbr64`.
+
+**A graphical boot menu can stop the machine from booting.** GRUB's `gfxpayload=keep`
+hands its graphics mode straight to the kernel, which is right only if the kernel can
+drive it. With `CONFIG_FB` and `CONFIG_FRAMEBUFFER_CONSOLE` off, the VT is left unusable,
+`setfont` fails, LFS' `S70console` exits 1, and init halts at "Press Enter to continue"
+with nobody there to press it. `gfxpayload=text` keeps the menu graphical and restores
+text mode before handing over. This is the second time a purely cosmetic feature has
+produced an unbootable system in this project — the first was an fstab entry for
+`securityfs`.
+
+**A shell variable called `STAMP` is not yours.** `/lib/lsb/init-functions` assigns one
+inside `log_info_msg` without declaring it local, so it silently overwrites a caller's
+variable of the same name. A first-boot script that recorded "already ran" in `$STAMP`
+wrote its marker to a file called `Aug 14 14:24:57 +00:00 bastion` in `/`, never found it
+again, and therefore re-ran on *every* boot — regenerating SSH host keys each time. There
+is no error message; the only symptom is a host whose fingerprints keep changing.
+`init-functions` also owns `BOOTLOG`, `BRACKET`, `COL`, `INFO`, `NORMAL`, `SCRIPT_STAT`,
+`SUCCESS`, `FAILURE` and `WARNING`.
+
+**Do not improve on the book's grub build.** Rebuilding grub with a hand-written configure
+line — dropping `sed 's/--image-base/--nonexist-linker-option/'`, which looks like a
+workaround for something long fixed — makes `grub-install` refuse the result:
+`kernel.img is miscompiled: its start address is 0x9074 instead of 0x9000: ld.gold bug?`.
+The error blames the linker for a configure choice.
 
 **The book's commands are written to run exactly once.** Six of them use `ln -sv` with no
 `-f`, so on a rebuild the link already exists, `ln` fails, and `set -e` takes the package

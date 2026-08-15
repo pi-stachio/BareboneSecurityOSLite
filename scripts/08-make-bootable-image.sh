@@ -79,16 +79,59 @@ umount "$LFS/mnt/target"
 echo "==> Writing grub.cfg"
 # console=tty0 keeps the VGA console working; console=ttyS0 lets a headless QEMU
 # run show the whole boot on stdout.
+CMDLINE="root=/dev/sda1 ro console=tty0 console=ttyS0,115200 net.ifnames=0 lockdown=integrity"
+
+# A graphical menu needs a font: gfxterm cannot draw a single character without a .pf2,
+# and LFS builds grub without FreeType so grub-mkfont never gets built. 21-boot-splash.sh
+# supplies both when it has been run; without it we still theme the text menu rather than
+# shipping grub's raw defaults.
+if [ -f "$MNT/boot/grub/fonts/unicode.pf2" ] && [ -f "$MNT/boot/grub/themes/bastion/theme.txt" ]; then
+    GFX=$(cat <<'EOF'
+insmod all_video
+insmod gfxterm
+insmod png
+insmod gfxmenu
+set gfxmode=1024x768,800x600,auto
+# text, NOT keep. `keep` hands GRUB's graphics mode straight to the kernel, and this
+# kernel has CONFIG_FB and CONFIG_FRAMEBUFFER_CONSOLE off -- so it has no driver for the
+# mode it inherits, the VT is left unusable, setfont fails, and LFS' S70console bootscript
+# exits 1 and halts init at "Press Enter to continue" with nobody there to press it.
+# The menu is still drawn graphically; GRUB just restores text mode before handing over.
+set gfxpayload=text
+terminal_output gfxterm
+loadfont /boot/grub/fonts/unicode.pf2
+set theme=/boot/grub/themes/bastion/theme.txt
+EOF
+)
+    echo "    graphical theme found; using gfxterm"
+else
+    GFX=$(cat <<'EOF'
+set menu_color_normal=light-gray/black
+set menu_color_highlight=black/light-cyan
+EOF
+)
+    echo "    no grub font; using the themed text menu"
+fi
+
 cat > "$MNT/boot/grub/grub.cfg" <<EOF
 set default=0
-set timeout=3
+set timeout=5
 
 insmod part_msdos
 insmod ext2
 
-menuentry "BastionOS (LFS 13.0 SysV), Linux $KERNEL" {
+$GFX
+
+menuentry "BastionOS" --class bastion {
     set root=(hd0,msdos1)
-    linux /boot/$KERNEL root=/dev/sda1 ro console=tty0 console=ttyS0,115200 net.ifnames=0 lockdown=integrity
+    linux /boot/$KERNEL $CMDLINE quiet loglevel=3
+}
+
+# The same system with the kernel talking. Every distro ships an equivalent, and on a
+# machine that will not boot it is the difference between a diagnosis and a guess.
+menuentry "BastionOS (verbose boot)" --class bastion {
+    set root=(hd0,msdos1)
+    linux /boot/$KERNEL $CMDLINE
 }
 EOF
 # lockdown=integrity activates the lockdown LSM: it blocks the interfaces that let root
@@ -143,19 +186,43 @@ else
     echo "ERROR: root password not set"; exit 1
 fi
 
-# Root SSH login is disabled (BLFS default), so remote access goes through the admin
-# account. Installing the host's public key makes that non-interactive and lets the
-# boot test actually log in over the network.
-if [ -d "$MNT/home/$ADMINUSER" ]; then
-    echo "==> Installing host SSH key for '$ADMINUSER'"
+# The build machine's public key must NOT ship in a public image.
+#
+# Up to v1.3.1 it did: every download authorised a key held by whoever built it, and
+# since SSH here refuses passwords, that key was also the *only* way in -- so the image
+# was simultaneously accessible to the builder and unusable over SSH by the person who
+# downloaded it. Both halves of that were wrong.
+#
+# Access is now provisioned by the operator on the console, with `bastionctl add-key`.
+# The boot test needs a key to drive its checks, so it sets PROVISION_TEST_KEY=1 and
+# injects one -- which is the same thing a real user does, not a special image.
+if [ -d "$MNT/home/$ADMINUSER" ] && [ "${PROVISION_TEST_KEY:-0}" = 1 ]; then
+    echo "==> Provisioning a test SSH key for '$ADMINUSER' (PROVISION_TEST_KEY=1)"
     [ -f /root/.ssh/id_ed25519 ] || ssh-keygen -q -t ed25519 -N '' -f /root/.ssh/id_ed25519
     install -d -m700 -o 1000 -g 1000 "$MNT/home/$ADMINUSER/.ssh"
     install -m600 -o 1000 -g 1000 /root/.ssh/id_ed25519.pub \
         "$MNT/home/$ADMINUSER/.ssh/authorized_keys"
-    echo "OK:    authorized_keys installed"
+    # Mark it. A test image and a release image differ by exactly one file, which is
+    # precisely the kind of difference that gets shipped by accident at 2am. The
+    # conversion step refuses to package an image carrying this marker.
+    install -d "$MNT/etc/bastionos"
+    echo "built $(date -u +%Y-%m-%dT%H:%M:%SZ) with PROVISION_TEST_KEY=1" \
+        > "$MNT/etc/bastionos/TEST-IMAGE-DO-NOT-RELEASE"
+    echo "OK:    test key installed, image marked TEST-IMAGE-DO-NOT-RELEASE"
 else
-    echo "    (no $ADMINUSER home yet - run 11-blfs-build.sh for SSH access)"
+    rm -f "$MNT/etc/bastionos/TEST-IMAGE-DO-NOT-RELEASE"
+    rm -f "$MNT/home/$ADMINUSER/.ssh/authorized_keys" 2>/dev/null || true
+    echo "==> No SSH key baked in (correct for a released image)"
+    echo "    the operator adds one on the console: bastionctl add-key '<key>'"
 fi
+
+# Host keys are generated on first boot by the firstboot service, never here. Anything
+# present has come from the build tree and would be identical in every download.
+if ls "$MNT"/etc/ssh/ssh_host_* > /dev/null 2>&1; then
+    rm -f "$MNT"/etc/ssh/ssh_host_*
+    echo "OK:    removed build-host SSH host keys (regenerated on first boot)"
+fi
+rm -f "$MNT/var/lib/bastionos/firstboot-done"
 
 echo "==> Verifying essentials are present"
 for f in /sbin/init /bin/bash /etc/fstab /boot/grub/grub.cfg "/boot/$KERNEL"; do

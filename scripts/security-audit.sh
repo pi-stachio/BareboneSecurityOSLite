@@ -243,6 +243,45 @@ else
     warn "no gcc on this system to check"
 fi
 
+hdr "Package integrity"
+# bpkg records a SHA256 for every file it installs, so this answers a question the rest
+# of the audit cannot: has anything been modified since it was put there? It only covers
+# packaged software -- the LFS base is not packaged -- which is stated rather than
+# glossed over, because a partial integrity check read as a total one is worse than none.
+if command -v bpkg > /dev/null 2>&1; then
+    n=$(bpkg list 2>/dev/null | grep -cv 'no packages' || true)
+    if [ "${n:-0}" -eq 0 ]; then
+        ok "no add-on packages installed"
+    else
+        echo "    $n package(s) installed via bpkg:"
+        bpkg list 2>/dev/null | sed 's/^/      /'
+        if out=$(bpkg verify 2>&1); then
+            ok "all packaged files match their recorded checksums"
+        else
+            bad "packaged files have been modified or are missing"
+            echo "$out" | grep -E 'MODIFIED|MISSING|modified' | head -8 | sed 's/^/      /'
+        fi
+        echo "    (covers packaged software only; the LFS base is not packaged)"
+    fi
+else
+    warn "bpkg not installed; no package integrity information"
+fi
+
+hdr "Time synchronisation"
+# A drifting clock breaks TLS with errors that blame the certificate, and makes every
+# log timestamp and the advisory report's date meaningless.
+if command -v chronyc > /dev/null 2>&1; then
+    if pgrep -x chronyd > /dev/null 2>&1; then
+        src=$(chronyc -n tracking 2>/dev/null | awk -F': *' '/Reference ID/{print $2}')
+        off=$(chronyc -n tracking 2>/dev/null | awk -F': *' '/System time/{print $2}')
+        ok "chronyd is running (ref ${src:-none}, ${off:-unknown})"
+    else
+        warn "chrony is installed but chronyd is not running"
+    fi
+else
+    warn "no time synchronisation installed — TLS will fail once the clock drifts"
+fi
+
 hdr "Known vulnerabilities in installed packages"
 # Read the cached report rather than querying NVD live: the scan is rate limited to
 # several minutes, and an audit that needs the network to finish is an audit that gets
