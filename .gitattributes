@@ -1,7 +1,8 @@
 # These scripts run under bash in WSL/Linux. If git checks them out with CRLF endings
 # (the Windows default), bash fails with "\r: command not found". Force LF everywhere.
-*.sh text eol=lf
-*.py text eol=lf
-*.md text eol=lf
+*.sh     text eol=lf
+*.py     text eol=lf
+*.md     text eol=lf
+*.recipe text eol=lf
 .gitignore text eol=lf
 .gitattributes text eol=lf
