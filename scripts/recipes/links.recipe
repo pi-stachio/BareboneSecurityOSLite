@@ -1,0 +1,47 @@
+# links -- a terminal web browser that renders tables, forms and CSS-less layout well.
+#
+# Chosen over browsh because browsh is a text *front end to Firefox*: it drives a real
+# headless Firefox and paints its output as coloured blocks. Installing it here would
+# mean installing X11, GTK3, cairo, pango, gdk-pixbuf, dbus, fontconfig and ALSA first,
+# then Firefox itself -- roughly 40 packages and ~1.5 GB, on a system built to be small.
+# `ssh brow.sh` gets you real browsh with nothing installed if you want the Firefox
+# rendering; links gets you actual browsing with no graphical stack at all.
+#
+# HTTPS works because OpenSSL is already part of the LFS base.
+
+name=links
+version=2.30
+url=http://links.twibright.com/download/links-2.30.tar.bz2
+sha256=c4631c6b5a11527cdc3cb7872fc23b7f2b25c2b021d596be410dadb40315f166
+
+build() {
+    # --enable-graphics is deliberately off. links can drive X11, SVGA or the framebuffer
+    # directly, and all three want libraries this system does not have (and a framebuffer
+    # console it deliberately does not enable). Text mode is the point.
+    # -std=gnu17 because gcc 15 defaults to C23, where strchr() preserves the constness
+    # of its argument. links does `*strchr(cast_const_char ud, POST_CHAR) = 0`, which was
+    # valid C for twenty years and is now "assignment of read-only location". Pinning the
+    # language standard is preferable to patching upstream source we do not maintain --
+    # it changes nothing about the code, and the hardening flags come from the compiler's
+    # specs file rather than CFLAGS, so they are unaffected.
+    # glibc 2.43 implements C23's const-preserving strchr: when the argument is a
+    # const char *, so is the result, and `*strchr(cast_const_char ud, C) = 0` becomes
+    # "assignment of read-only location". links casts to const purely to silence an
+    # older warning, then writes through the result.
+    #
+    # -std=gnu17 does NOT avoid this, which is the interesting part: links' com-defs.h
+    # defines _GNU_SOURCE, and that enables glibc's ISOC23 feature set irrespective of
+    # the language standard the compiler was asked for. So the fix is at the call site.
+    # One line in the whole tree; the guard makes a version bump fail loudly rather than
+    # skip the patch and fail confusingly at compile time.
+    grep -q '\*strchr(cast_const_char' ftp.c \
+        || { echo "links: expected strchr const-cast not found; recipe needs review"; return 1; }
+    sed -i 's|\*strchr(cast_const_char|*strchr(cast_char|g' ftp.c
+
+    ./configure --prefix=/usr           \
+                --mandir=/usr/share/man \
+                --without-x             \
+                --enable-javascript=no
+    make
+    make install DESTDIR="$PKGDIR"
+}

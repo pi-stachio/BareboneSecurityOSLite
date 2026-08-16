@@ -205,7 +205,13 @@ echo "    scanned $tot files ($dyn dynamic, $static static)"
 rate() { # label count total threshold-pct missingfile
     local p; p=$(pct "$2" "$3")
     printf '    %-24s %4d/%-4d %3d%%\n' "$1" "$2" "$3" "$p"
-    if [ "$p" -ge "$4" ]; then PASS=$((PASS+1)); else
+    if [ "$p" -ge "$4" ]; then
+        PASS=$((PASS+1))
+        # Name the stragglers even when the figure passes. "99%" with nothing to account
+        # for the missing 1% is the kind of number people stop reading, and the whole
+        # point of scanning everything was to be able to say which ones and why.
+        [ -s "$5" ] && show_missing "$5" "$1"
+    else
         if [ "$p" -ge $(( $4 - 10 )) ]; then warn "$1 at ${p}% (want ${4}%+)"
         else bad "$1 at ${p}% (want ${4}%+)"; fi
         show_missing "$5" "$1"

@@ -22,7 +22,7 @@ Grab the disk image from [Releases](../../releases), then:
 
 ```bash
 qemu-system-x86_64 -enable-kvm -m 2048 \
-    -drive file=bastionos-1.4.0-x86_64.qcow2,format=qcow2 -nographic
+    -drive file=bastionos-1.4.1-x86_64.qcow2,format=qcow2 -nographic
 ```
 
 The system comes up as **`bastion`**. Log in as **`root`** / **`lfs`**, or as **`admin`** /
@@ -45,7 +45,7 @@ so use the `admin` account:
 
 ```bash
 qemu-system-x86_64 -enable-kvm -m 2048 \
-    -drive file=bastionos-1.4.0-x86_64.qcow2,format=qcow2 \
+    -drive file=bastionos-1.4.1-x86_64.qcow2,format=qcow2 \
     -netdev user,id=n0,hostfwd=tcp::2222-:22 -device e1000,netdev=n0 -display none &
 ssh -p 2222 admin@localhost
 ```
@@ -57,15 +57,20 @@ Once inside, `sudo security-audit` reports what is actually true of the running 
 
 ```
 ELF hardening across the whole installed system
-    scanned 697 files (690 dynamic, 7 static)
-    full RELRO (BIND_NOW)     690/690  100%
-    PIE (executables)         580/580  100%
-    non-executable stack      690/690  100%
-    CET (IBT+SHSTK)           690/690  100%
-    stack canary              646/690   93%   (only where the code has a protectable frame)
-
-  57 passed, 0 warnings, 0 failures
+    scanned 705 files (698 dynamic, 7 static)
+    full RELRO (BIND_NOW)     698/698  100%
+    PIE (executables)         587/587  100%
+    non-executable stack      698/698  100%
+    CET (IBT+SHSTK)           697/698   99%
+    stack canary              654/698   93%   (only where the code has a protectable frame)
 ```
+
+The single binary without CET is `weathr`, and the reason is worth stating: it is written in
+Rust. Cargo links through `cc`, so the specs file still gives it full RELRO, `BIND_NOW` and
+PIE — but rustc does not emit the IBT/SHSTK property, and that property is an intersection
+across every input object, so one unmarked object clears it for the whole binary. There is
+no stable rustc flag for it (`-Z cf-protection` is nightly-only). The audit names it rather
+than rounding 99% up.
 
 ## Build it yourself
 
@@ -182,9 +187,23 @@ naming the owner, because on a system with no way to reinstall the base, one car
 overwrite of libc is unrecoverable. And every file's checksum is recorded, so `bpkg verify`
 detects modification after the fact and `security-audit` reports it.
 
-Three packages ship built with it, each closing a real gap: **chrony** (there was no time
-sync at all, and a drifting clock breaks TLS with errors that blame the certificate),
-**dcron**, and a small **log rotation** job (sysklogd wrote to `/var/log` without bound).
+Five packages ship built with it. Three close real gaps: **chrony** (there was no time sync
+at all, and a drifting clock breaks TLS with errors that blame the certificate), **dcron**,
+and a small **log rotation** job (sysklogd wrote to `/var/log` without bound). Two are
+just useful: **links**, a terminal web browser that does tables, forms and HTTPS, and
+**weathr**, a weather app with ASCII animations.
+
+Adding more is a recipe — name, version, URL, checksum, and a `build()` that installs into
+`$PKGDIR`:
+
+```bash
+bash scripts/23-build-package.sh scripts/recipes/links.recipe
+```
+
+`weathr` is the awkward case worth mentioning: it is written in Rust, which this system
+does not have. Rather than adding a 2.6 GB toolchain permanently, `24-build-weathr.sh`
+installs Rust to `/opt/rust`, builds the 7 MB binary, packages it, and deletes the
+toolchain again — a build dependency, not a runtime one.
 
 ### Knowing what you're running
 
@@ -294,6 +313,8 @@ Root SSH login stays disabled.
 | `20-package-image.sh` | Convert to qcow2, refusing to package a test image |
 | `21-boot-splash.sh` / `make-splash.py` | Graphical GRUB menu, quiet boot, console banner |
 | `22-seed-packages.sh` | Build chrony, dcron and log rotation as `bpkg` packages |
+| `23-build-package.sh` / `recipes/` | Build any package from a recipe and install it |
+| `24-build-weathr.sh` | weathr, using a throwaway Rust toolchain |
 | `bpkg.sh` | The package manager, installed as `/usr/bin/bpkg` |
 | `bastionctl.sh` | Operator helper, installed as `/usr/sbin/bastionctl` |
 | `security-audit.sh` | Installed as `/usr/sbin/security-audit` on the image |
