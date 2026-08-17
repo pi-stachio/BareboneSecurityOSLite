@@ -6,7 +6,7 @@
 # Boots /lfs-disk.img by default; point DISK_IMG at a released .qcow2 to try exactly
 # what a download gives you:
 #
-#   DISK_IMG=.../image/bastionos-1.4.0-x86_64.qcow2 bash scripts/run-lfs-gui.sh
+#   DISK_IMG=.../image/bastionos-1.5.0-x86_64.qcow2 bash scripts/run-lfs-gui.sh
 #
 # Log in as root / lfs. Type `poweroff` to shut down, or just close the window.
 set -euo pipefail

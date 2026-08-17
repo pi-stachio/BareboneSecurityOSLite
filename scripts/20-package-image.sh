@@ -15,6 +15,7 @@ VER=${1:-}
 IMG=${DISK_IMG:-/lfs-disk.img}
 OUT=${OUT_DIR:-/mnt/c/Users/neume/Desktop/Projects/BareboneSecurityOSLite/image}
 NAME="bastionos-$VER-x86_64.qcow2"
+VDI="bastionos-$VER-x86_64.vdi"
 MNT=/mnt/pkgcheck
 
 [ -f "$IMG" ] || { echo "FATAL: no image at $IMG"; exit 1; }
@@ -64,5 +65,31 @@ qemu-img convert -f raw -O qcow2 -c "$IMG" "$OUT/$NAME"
 cd "$OUT"
 ls -l --block-size=M "$NAME"
 sha256sum "$NAME" | tee "$NAME.sha256"
+
+# VirtualBox cannot read qcow2, and phone login is far easier to try there than under
+# QEMU: a bridged adapter puts the guest on the same network as the phone, with no port
+# forwarding and no `advertise` override. So ship a VDI as well.
+#
+# Zipped, not raw: the VDI is ~1.8 GB where the compressed form is a third of that, and
+# .zip is the one archive format a Windows machine opens with no extra software.
 echo
-echo "==> Releasable: $OUT/$NAME"
+echo "==> Converting to $VDI"
+# Only the versioned name is removed. A glob would take any scratch VDI sitting in this
+# directory with it, which is the sort of thing that eats a file someone was using.
+rm -f "$OUT/$VDI" "$OUT/$VDI.zip"
+qemu-img convert -f raw -O vdi "$IMG" "$OUT/$VDI"
+if command -v zip > /dev/null 2>&1; then
+    zip -q -j -9 "$OUT/$VDI.zip" "$OUT/$VDI"
+    rm -f "$OUT/$VDI"
+    ls -l --block-size=M "$VDI.zip"
+    sha256sum "$VDI.zip" | tee "$VDI.zip.sha256"
+else
+    echo "WARN:  no zip on this host; shipping the VDI uncompressed"
+    ls -l --block-size=M "$VDI"
+    sha256sum "$VDI" | tee "$VDI.sha256"
+fi
+
+echo
+echo "==> Releasable:"
+echo "    $OUT/$NAME"
+ls "$OUT/$VDI.zip" > /dev/null 2>&1 && echo "    $OUT/$VDI.zip" || echo "    $OUT/$VDI"

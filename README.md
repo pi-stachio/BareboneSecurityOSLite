@@ -19,11 +19,12 @@ scan a QR code with your phone to log in · no password typed, none stored
 
 ## Try it without building it
 
-Grab the disk image from [Releases](../../releases), then:
+Two images are on [Releases](../../releases): a **qcow2** for QEMU, and a zipped **VDI**
+for VirtualBox, which cannot read qcow2.
 
 ```bash
 qemu-system-x86_64 -enable-kvm -m 2048 \
-    -drive file=bastionos-1.4.1-x86_64.qcow2,format=qcow2 -nographic
+    -drive file=bastionos-1.5.0-x86_64.qcow2,format=qcow2 -nographic
 ```
 
 The system comes up as **`bastion`**. Log in as **`root`** / **`lfs`**, or as **`admin`** /
@@ -31,10 +32,45 @@ The system comes up as **`bastion`**. Log in as **`root`** / **`lfs`**, or as **
 `x` detaches. Change both passwords before putting this anywhere real — they are
 deliberately trivial so the image is useful to experiment with out of the box.
 
+**First boot takes about 90 seconds** before any login prompt appears: it generates this
+machine's own SSH host keys and grows the root filesystem to fill the disk. It has not
+hung.
+
+### Trying phone login
+
 `-nographic` puts you on the serial console, which keeps the ordinary password prompt.
-The **QR login screen is on the VGA console** (`tty1` and `tty2`), so drop `-nographic` to
-see it — and note that a phone can only reach the machine if the guest is on a network the
-phone can also reach, which QEMU's default user-mode networking is not.
+The QR login screen is on the **VGA console** (`tty1` and `tty2`), so drop `-nographic` to
+see it.
+
+To actually scan it, your phone has to be able to reach the machine, and QEMU's default
+user-mode networking NATs the guest where a phone cannot follow. The path of least
+resistance is VirtualBox with a **bridged** adapter, which puts the guest straight onto
+your network:
+
+```powershell
+$vb  = "C:\Program Files\Oracle\VirtualBox\VBoxManage.exe"
+$vdi = "C:\path\to\bastionos-1.5.0-x86_64.vdi"          # unzip it first
+
+& $vb createvm      --name BastionOS --ostype Linux_64 --register
+& $vb modifyvm      BastionOS --memory 2048 --cpus 2 --vram 32 --rtcuseutc on `
+                    --nic1 bridged --bridgeadapter1 "<your adapter>"
+& $vb storagectl    BastionOS --name IDE --add ide --controller PIIX4
+& $vb storageattach BastionOS --storagectl IDE --port 0 --device 0 --type hdd --medium $vdi
+& $vb startvm       BastionOS
+```
+
+`VBoxManage list bridgedifs` gives the adapter name. Then **Alt-F3** for a password
+prompt, `bastionctl register you`, scan, and **Alt-F1** to log in with the phone.
+
+Two things that will otherwise waste your afternoon. Removing the VM later with
+`unregistervm --delete` **deletes the attached VDI**, wherever it lives — use plain
+`unregistervm`. And if `VBoxManage` says *"the machine is not mutable"*, the VM is in a
+saved or running state; `discardstate` or `controlvm poweroff` first.
+
+Staying in QEMU is possible but needs the guest told which address the phone will use,
+since the one it can see is not that address — see
+[When the machine is behind NAT](#when-the-machine-is-behind-nat). The typed-code path
+(`[c]` on the login screen) needs none of this and works anywhere.
 
 **SSH refuses passwords by design and ships with no authorised key**, so remote login will
 turn you away until you add one from the console:
@@ -51,13 +87,13 @@ so use the `admin` account:
 
 ```bash
 qemu-system-x86_64 -enable-kvm -m 2048 \
-    -drive file=bastionos-1.4.1-x86_64.qcow2,format=qcow2 \
+    -drive file=bastionos-1.5.0-x86_64.qcow2,format=qcow2 \
     -netdev user,id=n0,hostfwd=tcp::2222-:22 -device e1000,netdev=n0 -display none &
 ssh -p 2222 admin@localhost
 ```
 
-It's a 12 GB virtual disk that compresses to ~530 MB. Works in Hyper-V and VirtualBox too
-(convert with `qemu-img convert`). eth0 uses DHCP, so it gets an address on any network.
+It's a 12 GB virtual disk that compresses to ~530 MB. Hyper-V works too — convert with
+`qemu-img convert -O vhdx`. eth0 uses DHCP, so it gets an address on any network.
 
 Once inside, `sudo security-audit` reports what is actually true of the running system:
 
