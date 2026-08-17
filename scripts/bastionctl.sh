@@ -20,8 +20,16 @@ bastionctl -- BastionOS operator helper
   status                       hostname, address, uptime, firewall, advisories
   set-hostname <name>          change the hostname (persists across reboot)
 
+Phone login (tty1 and tty2 show a QR code instead of a password prompt):
+
+  register [--admin] [--totp] <account> [device-name]
+                               create the account if needed and enrol a phone
+  devices [account]            list enrolled phones
+  revoke <device-id>           stop a phone from logging in
+
 SSH here refuses passwords by design, so a key must be added from the console
-before remote login will work.
+before remote login will work. Phone login is for the console only: without
+Linux-PAM, sshd has no hook for it.
 EOF
 }
 
@@ -74,6 +82,14 @@ remove-key)
     sed -i "${n}d" "$AK" && echo "removed key $n"
     ;;
 
+register|devices|revoke)
+    # Enrolment needs a socket, JSON and a QR encoder, none of which belong in a
+    # shell script. bastion-qradmin does the work; this is only the front door.
+    [ -x /usr/sbin/bastion-qradmin ] || {
+        echo "phone login is not installed on this system" >&2; exit 1; }
+    exec /usr/sbin/bastion-qradmin "$@"
+    ;;
+
 fingerprints)
     for k in /etc/ssh/ssh_host_*_key.pub; do
         [ -e "$k" ] || continue
@@ -111,6 +127,11 @@ status)
     if [ -r /etc/bastionos/vuln-report.txt ]; then
         echo "advisories: $(grep -m1 '^SUMMARY' /etc/bastionos/vuln-report.txt | sed 's/^SUMMARY //')"
         echo "            as of $(awk '/^# generated:/{print $3}' /etc/bastionos/vuln-report.txt)"
+    fi
+    if [ -x /usr/sbin/bastion-qradmin ]; then
+        /usr/sbin/bastion-qradmin status 2>/dev/null | sed 's/^/           /' \
+            | sed '1s/^ *//;1s/^/phone:     /' \
+            || echo "phone:     login daemon not responding"
     fi
     if [ -e /var/lib/bastionos/firstboot-done ]; then
         echo "firstboot: completed $(cat /var/lib/bastionos/firstboot-done)"

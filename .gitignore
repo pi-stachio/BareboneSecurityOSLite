@@ -10,3 +10,8 @@ book-commands/
 
 # Build logs and scratch
 *.log
+
+# Python leaves these behind wherever a module is imported from, including the test
+# helpers in scripts/qrauth.
+__pycache__/
+*.pyc

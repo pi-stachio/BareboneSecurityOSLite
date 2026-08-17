@@ -1,0 +1,259 @@
+#!/usr/bin/python3
+"""bastion-qradmin -- enrol and revoke phones. Reached through `bastionctl`.
+
+Everything privileged happens here rather than in bastionctl, which is a shell script
+and has no business speaking JSON over a socket or drawing QR codes. The device store
+itself is written only by bastion-qrauthd; this asks it to.
+"""
+import getpass
+import grp
+import json
+import os
+import pwd
+import re
+import socket
+import subprocess
+import sys
+
+sys.path.insert(0, "/usr/lib/bastionos")
+sys.path.insert(1, os.path.dirname(os.path.abspath(__file__)))
+import bastion_qr  # noqa: E402
+
+SOCK = os.environ.get("BASTION_QRAUTH_SOCK", "/run/bastionos/qrauth.sock")
+USER_RE = re.compile(r"^[a-z_][a-z0-9_-]{0,31}$")
+
+
+def die(msg, code=1):
+    sys.stderr.write(msg.rstrip() + "\n")
+    sys.exit(code)
+
+
+def ask(req):
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(15)
+        s.connect(SOCK)
+    except OSError as exc:
+        die("cannot reach the login daemon (%s): %s\n"
+            "is it running?  /etc/rc.d/init.d/qrauthd status" % (SOCK, exc))
+    try:
+        s.sendall((json.dumps(req) + "\n").encode())
+        data = b""
+        while b"\n" not in data:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        return json.loads(data.decode().split("\n", 1)[0])
+    finally:
+        s.close()
+
+
+def show_qr(text):
+    """Draw a QR on the console, or explain why it will not fit.
+
+    Always called last. A version 5 symbol is 23 rows and a version 6 is 25, so on an
+    80x25 console anything printed after it pushes the top of the code off the screen
+    -- and half a QR code is not a QR code. Instructions go first.
+    """
+    try:
+        matrix, version = bastion_qr.encode(text, "M")
+    except bastion_qr.QRError as exc:
+        print("  (cannot draw a code: %s)" % exc)
+        return False
+    lines = bastion_qr.to_halfblocks(matrix)
+    try:
+        rows = os.get_terminal_size().lines
+    except OSError:
+        rows = 25
+    if len(lines) > rows:
+        print("  This console is %d rows and a version %d code needs %d."
+              % (rows, version, len(lines)))
+        print("  Use a taller terminal (SSH in and re-run), or enrol with an")
+        print("  authenticator app using the secret above.")
+        return False
+    for line in lines:
+        print(line)
+    return True
+
+
+def require_root():
+    if os.geteuid() != 0:
+        die("must be root")
+
+
+def user_exists(name):
+    try:
+        pwd.getpwnam(name)
+        return True
+    except KeyError:
+        return False
+
+
+def run(cmd):
+    r = subprocess.run(cmd, capture_output=True)
+    if r.returncode != 0:
+        die("%s failed: %s" % (" ".join(cmd), r.stderr.decode().strip()))
+
+
+def cmd_register(argv):
+    require_root()
+    admin = "--admin" in argv
+    totp_only = "--totp" in argv
+    args = [a for a in argv if not a.startswith("--")]
+    if not args:
+        die("usage: bastionctl register [--admin] [--totp] <account> [device-name]")
+    user = args[0]
+    device = args[1] if len(args) > 1 else "phone"
+    if not USER_RE.match(user):
+        die("'%s' is not a valid account name" % user)
+    if user == "root":
+        die("root keeps a password on the console. A phone is a single point of\n"
+            "failure and the way back in must not depend on one.")
+
+    created = False
+    if not user_exists(user):
+        run(["/usr/sbin/useradd", "-m", "-s", "/bin/bash", user])
+        created = True
+        # No password rather than a locked one. useradd leaves '!' in the shadow field,
+        # which several tools read as "account locked" and refuse outright; '*' means
+        # "no password will ever match", which is what is actually wanted here. The
+        # account is reached by phone, and there is no string anyone can type to
+        # become it.
+        run(["/usr/sbin/usermod", "-p", "*", user])
+
+    if admin:
+        try:
+            grp.getgrnam("wheel")
+        except KeyError:
+            run(["/usr/sbin/groupadd", "wheel"])
+        run(["/usr/sbin/usermod", "-aG", "wheel", user])
+        print("'%s' is now in the wheel group and may use sudo." % user)
+        print()
+        print("sudo authenticates against /etc/shadow, so it needs a password, and")
+        print("there is only one password field per account. Setting one here means")
+        print("that password ALSO works at an ordinary login prompt -- on tty3 to")
+        print("tty6, or over the serial console. If you would rather this account be")
+        print("reachable only by phone, answer no and use the admin account for")
+        print("anything needing root.")
+        print()
+        if input("set a sudo password for %s? [y/N] " % user).strip().lower() == "y":
+            while True:
+                p1 = getpass.getpass("password: ")
+                p2 = getpass.getpass("again: ")
+                if p1 != p2:
+                    print("they do not match.")
+                    continue
+                if len(p1) < 8:
+                    print("too short; 8 characters minimum.")
+                    continue
+                break
+            proc = subprocess.run(["/usr/bin/chpasswd"],
+                                  input=("%s:%s" % (user, p1)).encode(),
+                                  capture_output=True)
+            if proc.returncode != 0:
+                die("could not set the password: %s" % proc.stderr.decode().strip())
+            print("password set.")
+        else:
+            print("no password set: sudo will refuse this account until one is.")
+
+    reply = ask({"op": "register", "user": user, "name": device})
+    if not reply.get("ok"):
+        die("enrolment failed: %s" % reply.get("error"))
+
+    print()
+    if created:
+        print("created account '%s'." % user)
+    print("enrolled device '%s' (%s) for %s." % (device, reply["devid"], user))
+    print()
+
+    # Everything explanatory is printed before the code, because the code is the tall
+    # thing and must be what survives on screen.
+    if totp_only or not reply.get("url"):
+        if not reply.get("url"):
+            print("This machine has no network address, so the tap-to-approve page")
+            print("cannot be reached. Use an authenticator app instead.")
+            print()
+        print("  Scan into any authenticator app (Aegis, FreeOTP, Google")
+        print("  Authenticator), or type the secret in by hand:")
+        print("      %s" % reply["secret"])
+        print()
+        print("  Then log in by pressing [c] on the console and entering the code.")
+        print()
+        show_qr(reply["totp_uri"])
+        return
+
+    print("  Scan with the phone's camera within %d minutes." % (reply["ttl"] // 60))
+    print("  It opens a page on %s that stores the key in that browser," % reply["addr"])
+    print("  and nowhere else -- keep that browser.")
+    print()
+    print("  For an authenticator app instead, the secret is")
+    print("      %s" % reply["secret"])
+    print("  or re-run with --totp for a code you can scan into one.")
+    print()
+    show_qr(reply["url"])
+
+
+def cmd_devices(argv):
+    reply = ask({"op": "devices", "user": argv[0] if argv else None})
+    if not reply.get("ok"):
+        die(reply.get("error", "failed"))
+    devices = reply["devices"]
+    if not devices:
+        print("no phones enrolled.  bastionctl register <account>")
+        return
+    import time
+    print("%-14s %-12s %-14s %-12s %s"
+          % ("DEVICE", "ACCOUNT", "NAME", "LAST USED", ""))
+    now = time.time()
+    for d in devices:
+        last = d.get("last_used") or 0
+        when = time.strftime("%Y-%m-%d", time.localtime(last)) if last else "never"
+        note = ""
+        if d.get("locked_until", 0) > now:
+            note = "LOCKED for %dm" % ((d["locked_until"] - now) // 60 + 1)
+        print("%-14s %-12s %-14s %-12s %s"
+              % (d["devid"], d["user"], d["name"], when, note))
+
+
+def cmd_revoke(argv):
+    require_root()
+    if not argv:
+        die("usage: bastionctl revoke <device-id>   (see bastionctl devices)")
+    reply = ask({"op": "revoke", "devid": argv[0]})
+    if not reply.get("ok"):
+        die("revoke failed: %s" % reply.get("error"))
+    print("revoked %s. That phone can no longer log in." % argv[0])
+
+
+def cmd_status(argv):
+    reply = ask({"op": "status"})
+    if not reply.get("ok"):
+        die(reply.get("error", "failed"))
+    print("phone login: %d device(s) enrolled" % reply["devices"])
+    print("  port %d: %s" % (reply["port"],
+                             "open" if reply["listening"] else "closed"))
+    if reply.get("base"):
+        print("  phones reach it at %s%s"
+              % (reply["base"], "  (advertise= override)" if reply.get("advertised")
+                 else ""))
+    else:
+        print("  no network address, so only the typed-code path works")
+    if reply["pending"]:
+        print("  %d login(s) waiting for approval" % reply["pending"])
+    if reply["enrolling"]:
+        print("  an enrolment window is open")
+
+
+COMMANDS = {"register": cmd_register, "devices": cmd_devices,
+            "revoke": cmd_revoke, "status": cmd_status}
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] not in COMMANDS:
+        die("usage: bastion-qradmin {register|devices|revoke|status} [...]")
+    COMMANDS[sys.argv[1]](sys.argv[2:])
+
+
+if __name__ == "__main__":
+    main()

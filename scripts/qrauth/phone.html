@@ -1,0 +1,289 @@
+<!-- Served by bastion-qrauthd for both enrolment (/e) and approval (/a).
+     __BASTION_DATA__ is replaced with a small JSON object before sending.
+
+     SHA-256 and HMAC are implemented here by hand because this page is reached over
+     plain HTTP on a local network, which is not a "secure context", so
+     window.crypto.subtle does not exist. There is no CDN either -- the machine serving
+     this page may have no route to the internet, and pulling auth code from a third
+     party would be a poor idea on a login path regardless. -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>BastionOS</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; font: 17px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI",
+         Roboto, sans-serif; background: #14161a; color: #e6e8ea;
+         display: flex; min-height: 100vh; align-items: center; justify-content: center; }
+  main { width: 100%; max-width: 26rem; padding: 1.5rem; box-sizing: border-box; }
+  h1 { font-size: 1.15rem; margin: 0 0 .25rem; letter-spacing: .01em; }
+  .host { color: #8b949e; font-size: .9rem; margin: 0 0 1.5rem; }
+  .card { background: #1c1f24; border: 1px solid #2a2f36; border-radius: .75rem;
+          padding: 1.1rem; margin-bottom: .75rem; }
+  .who { font-size: 1.35rem; font-weight: 600; margin: 0 0 .2rem; }
+  .sub { color: #8b949e; font-size: .85rem; margin: 0; }
+  button { width: 100%; padding: .95rem; font-size: 1.05rem; font-weight: 600;
+           border: 0; border-radius: .6rem; background: #2f81f7; color: #fff;
+           cursor: pointer; margin-top: .5rem; }
+  button:active { background: #2569c9; }
+  button[disabled] { background: #30353c; color: #6e7681; }
+  .ok { color: #3fb950; } .bad { color: #f85149; }
+  .msg { margin-top: 1rem; font-size: .95rem; }
+  code { background: #0d1117; padding: .15rem .35rem; border-radius: .25rem;
+         font-size: .85rem; word-break: break-all; }
+</style>
+</head>
+<body>
+<main>
+  <h1>BastionOS</h1>
+  <p class="host" id="host"></p>
+  <div id="body"></div>
+  <p class="msg" id="msg"></p>
+</main>
+<script>
+"use strict";
+var D = __BASTION_DATA__;
+
+/* ---------- SHA-256 ---------- */
+var K = [
+  0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+  0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+  0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+  0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+  0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+  0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+  0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+  0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2];
+
+function rotr(x, n) { return (x >>> n) | (x << (32 - n)); }
+
+function sha256(msg) {
+  var H = [0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,
+           0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19];
+  var l = msg.length;
+  var pad = (64 - ((l + 9) % 64)) % 64;
+  var buf = new Uint8Array(l + 1 + pad + 8);
+  buf.set(msg);
+  buf[l] = 0x80;
+  /* Length in bits as a 64-bit big-endian value. Split so a payload over 512 MB
+     would still be counted correctly rather than silently wrapping. */
+  var hi = Math.floor(l / 536870912);
+  var lo = (l * 8) >>> 0;
+  var p = buf.length - 8;
+  buf[p] = (hi >>> 24) & 255; buf[p+1] = (hi >>> 16) & 255;
+  buf[p+2] = (hi >>> 8) & 255; buf[p+3] = hi & 255;
+  buf[p+4] = (lo >>> 24) & 255; buf[p+5] = (lo >>> 16) & 255;
+  buf[p+6] = (lo >>> 8) & 255; buf[p+7] = lo & 255;
+
+  var w = new Array(64);
+  for (var i = 0; i < buf.length; i += 64) {
+    for (var t = 0; t < 16; t++) {
+      w[t] = ((buf[i+4*t] << 24) | (buf[i+4*t+1] << 16) |
+              (buf[i+4*t+2] << 8) | buf[i+4*t+3]) | 0;
+    }
+    for (t = 16; t < 64; t++) {
+      var x = w[t-15], y = w[t-2];
+      var s0 = rotr(x,7) ^ rotr(x,18) ^ (x >>> 3);
+      var s1 = rotr(y,17) ^ rotr(y,19) ^ (y >>> 10);
+      w[t] = (((w[t-16] + s0) | 0) + ((w[t-7] + s1) | 0)) | 0;
+    }
+    var a=H[0],b=H[1],c=H[2],d=H[3],e=H[4],f=H[5],g=H[6],h=H[7];
+    for (t = 0; t < 64; t++) {
+      var S1 = rotr(e,6) ^ rotr(e,11) ^ rotr(e,25);
+      var ch = (e & f) ^ (~e & g);
+      var t1 = (((((h + S1) | 0) + ((ch + K[t]) | 0)) | 0) + w[t]) | 0;
+      var S0 = rotr(a,2) ^ rotr(a,13) ^ rotr(a,22);
+      var mj = (a & b) ^ (a & c) ^ (b & c);
+      var t2 = (S0 + mj) | 0;
+      h=g; g=f; f=e; e=(d + t1) | 0; d=c; c=b; b=a; a=(t1 + t2) | 0;
+    }
+    H[0]=(H[0]+a)|0; H[1]=(H[1]+b)|0; H[2]=(H[2]+c)|0; H[3]=(H[3]+d)|0;
+    H[4]=(H[4]+e)|0; H[5]=(H[5]+f)|0; H[6]=(H[6]+g)|0; H[7]=(H[7]+h)|0;
+  }
+  var out = new Uint8Array(32);
+  for (i = 0; i < 8; i++) {
+    out[4*i]   = (H[i] >>> 24) & 255;
+    out[4*i+1] = (H[i] >>> 16) & 255;
+    out[4*i+2] = (H[i] >>> 8) & 255;
+    out[4*i+3] = H[i] & 255;
+  }
+  return out;
+}
+
+function concat(a, b) {
+  var out = new Uint8Array(a.length + b.length);
+  out.set(a); out.set(b, a.length);
+  return out;
+}
+
+function hmacSha256(key, msg) {
+  if (key.length > 64) key = sha256(key);
+  var ki = new Uint8Array(64), ko = new Uint8Array(64);
+  for (var i = 0; i < 64; i++) {
+    var k = i < key.length ? key[i] : 0;
+    ki[i] = k ^ 0x36;
+    ko[i] = k ^ 0x5c;
+  }
+  return sha256(concat(ko, sha256(concat(ki, msg))));
+}
+
+function hex(bytes) {
+  var s = "";
+  for (var i = 0; i < bytes.length; i++) s += (bytes[i] + 0x100).toString(16).slice(1);
+  return s;
+}
+
+function utf8(str) {
+  var out = [], i, c;
+  for (i = 0; i < str.length; i++) {
+    c = str.charCodeAt(i);
+    if (c < 0x80) out.push(c);
+    else if (c < 0x800) out.push(0xc0 | (c >> 6), 0x80 | (c & 63));
+    else out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63));
+  }
+  return new Uint8Array(out);
+}
+
+function b32decode(s) {
+  var A = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+  s = s.toUpperCase().replace(/=+$/, "");
+  var bits = 0, value = 0, out = [];
+  for (var i = 0; i < s.length; i++) {
+    var idx = A.indexOf(s.charAt(i));
+    if (idx < 0) throw new Error("bad base32");
+    value = (value << 5) | idx;
+    bits += 5;
+    if (bits >= 8) { bits -= 8; out.push((value >>> bits) & 255); }
+  }
+  return new Uint8Array(out);
+}
+
+/* ---------- storage ---------- */
+/* Keyed on the machine's hostname rather than its address, so a device stays enrolled
+   when the machine's IP changes -- which it will, on DHCP. */
+function storeKey() { return "bastionos:" + D.host; }
+
+function loadDevices() {
+  try { return JSON.parse(localStorage.getItem(storeKey())) || []; }
+  catch (e) { return []; }
+}
+
+function saveDevices(list) {
+  localStorage.setItem(storeKey(), JSON.stringify(list));
+}
+
+/* ---------- ui ---------- */
+var $body = document.getElementById("body");
+var $msg = document.getElementById("msg");
+document.getElementById("host").textContent = D.host +
+    (D.addr ? " · " + D.addr : "");
+
+function say(text, cls) {
+  $msg.className = "msg " + (cls || "");
+  $msg.textContent = text;
+}
+
+function post(path, obj, cb) {
+  var x = new XMLHttpRequest();
+  x.open("POST", path, true);
+  x.setRequestHeader("Content-Type", "application/json");
+  x.timeout = 15000;
+  x.onreadystatechange = function () {
+    if (x.readyState !== 4) return;
+    var r = null;
+    try { r = JSON.parse(x.responseText); } catch (e) {}
+    cb(x.status === 200 && r && r.ok, r);
+  };
+  x.ontimeout = function () { cb(false, null); };
+  x.send(JSON.stringify(obj));
+}
+
+function enrol() {
+  /* devid and secret arrive in the fragment, which the browser does not send to the
+     server. Strip it from the address bar once stored so it is not sitting in the
+     visible URL, and so a reload does not re-enrol. */
+  var frag = location.hash.replace(/^#/, "");
+  var dot = frag.indexOf(".");
+  if (dot < 1) {
+    $body.innerHTML = '<div class="card"><p class="sub">This enrolment link is '
+        + 'incomplete. Run <code>bastionctl register</code> again and scan the new '
+        + 'code.</p></div>';
+    return;
+  }
+  var devid = frag.slice(0, dot), secret = frag.slice(dot + 1);
+  try { b32decode(secret); } catch (e) {
+    $body.innerHTML = '<div class="card"><p class="sub">This enrolment link is '
+        + 'damaged.</p></div>';
+    return;
+  }
+  var list = loadDevices().filter(function (d) { return d.devid !== devid; });
+  list.push({ devid: devid, secret: secret, user: D.user });
+  saveDevices(list);
+  if (history.replaceState) history.replaceState(null, "", location.pathname);
+
+  $body.innerHTML = '<div class="card"><p class="who">' + esc(D.user) + '</p>'
+      + '<p class="sub">enrolled on this phone</p></div>';
+  say("Next time the console shows a login code, scan it and tap Approve. "
+      + "Keep this browser — the key is stored in it.", "ok");
+}
+
+function approve() {
+  var list = loadDevices();
+  if (!list.length) {
+    $body.innerHTML = '<div class="card"><p class="sub">This phone is not enrolled on '
+        + esc(D.host) + '.</p></div>';
+    say("On the console, run: bastionctl register <your account>");
+    return;
+  }
+  list.forEach(function (dev) {
+    var card = document.createElement("div");
+    card.className = "card";
+    var who = document.createElement("p");
+    who.className = "who";
+    who.textContent = dev.user;
+    var sub = document.createElement("p");
+    sub.className = "sub";
+    sub.textContent = "on " + D.tty;
+    var btn = document.createElement("button");
+    btn.textContent = "Approve login";
+    btn.onclick = function () {
+      btn.disabled = true;
+      say("Signing…");
+      var resp;
+      try {
+        resp = hex(hmacSha256(b32decode(dev.secret), utf8(D.nonce)));
+      } catch (e) {
+        btn.disabled = false;
+        say("Could not use the stored key. Re-enrol this phone.", "bad");
+        return;
+      }
+      post("/r", { sid: D.sid, devid: dev.devid, resp: resp }, function (ok, r) {
+        if (ok) {
+          btn.textContent = "Approved";
+          say("Logged in as " + dev.user + " on " + D.tty + ".", "ok");
+        } else {
+          btn.disabled = false;
+          say((r && r.error) || "The machine refused that, or the code expired. "
+              + "Get a fresh code on the console.", "bad");
+        }
+      });
+    };
+    card.appendChild(who);
+    card.appendChild(sub);
+    card.appendChild(btn);
+    $body.appendChild(card);
+  });
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"']/g, function (c) {
+    return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c];
+  });
+}
+
+if (D.mode === "enrol") enrol(); else approve();
+</script>
+</body>
+</html>

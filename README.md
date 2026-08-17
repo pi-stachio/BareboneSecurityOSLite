@@ -12,6 +12,7 @@ LFS 13.0 (SysV) · x86_64 · kernel 6.18.10 · gcc 15.2.0 · glibc 2.43 · binut
 651 binaries · 1.5 GB installed · GRUB on MBR · boots in QEMU, Hyper-V or VirtualBox
 KASLR · Landlock/Yama/lockdown · no loadable modules · nftables default-deny
 full RELRO · PIE · _FORTIFY_SOURCE=3 · CET · stack-clash protection, system-wide
+scan a QR code with your phone to log in · no password typed, none stored
 ```
 
 ---
@@ -29,6 +30,11 @@ The system comes up as **`bastion`**. Log in as **`root`** / **`lfs`**, or as **
 **`lfs`** (in the `wheel` group, so `sudo` works). `poweroff` shuts it down; `Ctrl-a` then
 `x` detaches. Change both passwords before putting this anywhere real — they are
 deliberately trivial so the image is useful to experiment with out of the box.
+
+`-nographic` puts you on the serial console, which keeps the ordinary password prompt.
+The **QR login screen is on the VGA console** (`tty1` and `tty2`), so drop `-nographic` to
+see it — and note that a phone can only reach the machine if the guest is on a network the
+phone can also reach, which QEMU's default user-mode networking is not.
 
 **SSH refuses passwords by design and ships with no authorised key**, so remote login will
 turn you away until you add one from the console:
@@ -147,6 +153,7 @@ downloaded image awkward — or, in one case, impossible — to run:
 bash scripts/19-firstboot.sh     # first-boot setup + bastionctl
 bash scripts/21-boot-splash.sh   # graphical boot menu, quiet boot, console banner
 bash scripts/22-seed-packages.sh # bpkg + chrony, dcron, log rotation
+bash scripts/25-qr-login.sh      # log in by scanning a QR code with your phone
 ```
 
 **First boot** generates this machine's own SSH host keys and prints their fingerprints
@@ -204,6 +211,13 @@ bash scripts/23-build-package.sh scripts/recipes/links.recipe
 does not have. Rather than adding a 2.6 GB toolchain permanently, `24-build-weathr.sh`
 installs Rust to `/opt/rust`, builds the 7 MB binary, packages it, and deletes the
 toolchain again — a build dependency, not a runtime one.
+
+### Logging in with your phone
+
+`tty1` and `tty2` show a QR code instead of a password prompt. Point a camera at it, tap
+**Approve**, and you are logged in — no password, and nothing typed. The full lifecycle
+— registering an account, both login paths, managing devices, and how to get back in
+when the phone is gone — is in [Phone login](#phone-login) below.
 
 ### Knowing what you're running
 
@@ -286,6 +300,222 @@ That adds `sudo`, `openssh`, `dhcpcd`, `iputils`, `curl` (with `libpsl`), and `m
 a real 172-certificate Mozilla trust store, plus an `admin` account in the `wheel` group.
 Root SSH login stays disabled.
 
+## Phone login
+
+`tty1` and `tty2` show a QR code instead of a password prompt. Scan it, tap **Approve**,
+and you are in — nothing typed, and no password to steal, phish or reuse.
+
+```
+BastionOS                                              bastion tty1
+
+Scan to log in                          ███████████████████████
+                                        ██ ▄▄▄▄▄ █▀▄█ ▄▄▄▄▄ ████
+  1. point your phone's camera           ██ █   █ █▀▀█ █   █ ████
+     at the code                         ██ █▄▄▄█ █▄ ▄ █▄▄▄█ ████
+  2. tap Approve                         ██▄▄▄▄▄▄▄█▄█▄▄▄▄▄▄▄▄████
+
+No phone on this network?
+ press [c] to type a code
+                                        (a real code is 29 modules
+ press [p] for a password                across; this one is trimmed)
+ expires in 87s
+```
+
+### What a phone account is
+
+`bastionctl register` creates an ordinary Unix account with one difference: its password
+field is `*`. That is not "locked" — it means **no string exists that will ever match**.
+The phone is genuinely the only way in.
+
+That has a consequence worth stating plainly rather than discovering: **an account with no
+password cannot `sudo`**, because `sudo` authenticates against `/etc/shadow` and there is
+nothing there to authenticate against. A phone gives you a *session*, not privilege. Three
+ways to live with that:
+
+| | What you get | What it costs |
+|---|---|---|
+| Leave it (default) | Phone login only; escalate via `admin` or `root` on another tty | Two accounts to think about |
+| `register --admin you` | `wheel` membership and a sudo password | One password field per account, so that password *also* works at the prompts on `tty3`–`tty6` |
+| Don't register; use `admin` | Everything as before | No phone login |
+
+`root` is refused outright. A phone is a single point of failure and the way back in must
+not depend on one.
+
+### Registering
+
+One command, on the console, as root. It creates the account if it does not exist:
+
+```
+# bastionctl register alice
+created account 'alice'.
+enrolled device 'phone' (fe55d44a) for alice.
+
+  Scan with the phone's camera within 5 minutes.
+  It opens a page on 192.168.1.50:8043 that stores the key in that browser,
+  and nowhere else -- keep that browser.
+
+  For an authenticator app instead, the secret is
+      RUZAHVENDRBO77FFGCAHYB3BCIRU6XFJ
+  or re-run with --totp for a code you can scan into one.
+
+  <QR code>
+```
+
+What actually happens:
+
+1. The daemon generates a **160-bit secret** and a device id.
+2. It shows a URL in a QR code with the secret in the **fragment** — the part after `#`,
+   which browsers never send to a server. The secret travels from machine to phone
+   *optically* and does not cross the network in either direction.
+3. Your phone opens the page, stores `{device id, secret, account}` in that browser's
+   local storage, and strips the fragment from the address bar.
+4. Nothing is sent back. The machine already knows the secret; it generated it.
+
+Variants:
+
+```
+bastionctl register --totp alice   # otpauth:// code for an authenticator app instead
+bastionctl register --admin alice  # also add to wheel, and offer to set a sudo password
+bastionctl register alice pixel-8  # name the device, so `devices` is readable later
+```
+
+The instructions print *above* the code deliberately: a version 5 symbol is 23 rows, and
+anything printed after it on an 80×25 console pushes the top of the code off the screen.
+Half a QR code is not a QR code.
+
+### Logging in
+
+**Tap to approve.** The console shows a URL and a **one-time nonce**. Your phone computes
+`HMAC-SHA256(secret, nonce)` and posts the result:
+
+```
+console                     phone                       machine
+  shows QR (nonce)  ──scan──▶
+                             GET /a?<session>   ──────▶  serves the page + nonce
+                             HMAC(secret,nonce) ──────▶  verifies, marks approved
+  execs `login -f alice` ◀──────────────────────────────  yes
+```
+
+The secret never moves. The nonce is single-use and expires in 90 seconds, so a captured
+reply is worth nothing. On approval the login program execs `login -f`, so utmp, wtmp, the
+environment, the motd and ownership of the tty are handled by the same program that would
+have handled them after a password — nothing here reimplements becoming a user.
+
+**Type a code.** Press `[c]`. The same secret is a standard RFC 6238 TOTP secret, so any
+authenticator app works and **nothing has to reach the machine over IP at all**:
+
+```
+account: alice
+6-digit code: 481920
+```
+
+This path exists because a login mechanism that requires a working LAN is not a login
+mechanism. It is the one that still works when your phone is on mobile data, when the
+machine has no address yet, or when the network is the thing you are logging in to fix.
+
+Codes are single-use — a code already accepted is refused even inside its 30-second
+window, so reading one over someone's shoulder buys nothing.
+
+### Who am I, and which phones can log in as me
+
+From your own session, no privileges needed:
+
+```
+$ whoami
+alice
+$ bastionctl devices
+DEVICE     ACCOUNT   NAME       LAST USED
+fe55d44a   alice     pixel-8    2026-08-17
+```
+
+The daemon decides what a caller may do from the **peer uid the kernel reports**, not from
+file permissions or anything the caller sends:
+
+| Caller | May do |
+|---|---|
+| `root` | everything |
+| any local user | `devices` (their own) and `status` |
+| any local user | *cannot* start a login, enrol, revoke, or check a code |
+
+Asking for another account's devices quietly returns your own rather than erroring —
+an error would leak whether that account exists. This matters more than it looks: a phone
+account has no password, so it cannot `sudo`, so requiring root to answer "which phones
+can log in as me?" would mean the person it concerns is the one person who cannot ask.
+
+On the phone, the account name is on the card you tap, above `on tty1`, so you see which
+account you are about to become *before* approving. A phone enrolled for two accounts
+shows one card each.
+
+Every enrolment and login is recorded in `/var/log/bastionos/qrauth.log`:
+
+```
+ENROL alice as device fe55d44a (pixel-8)
+APPROVE fe55d44a as alice on tty1
+REJECT typed code for alice: that code is not valid
+```
+
+### Getting back in
+
+| Situation | Way in |
+|---|---|
+| Lost the phone | `tty3`–`tty6` or serial: log in as `root`, then `bastionctl revoke <device>` and re-register |
+| Cleared the browser | Same — the key lived in that browser only. Revoke and re-register |
+| Daemon not running | `tty1` falls back to the password prompt by itself; `/etc/rc.d/init.d/qrauthd status`, and the traceback is in `qrauth.log` |
+| Phone not on this network | Press `[c]` and type a code |
+| Machine has no address yet | The login screen waits ~25s for it, then offers the password prompt |
+| Code scans but will not connect | The machine is behind NAT — see `advertise` below |
+| Too many wrong codes | The device locks for 5 minutes; `bastionctl devices` shows the countdown |
+
+`tty3`–`tty6` and the serial console **always** keep the ordinary password prompt. If the
+daemon fails to start, agetty respawns its login program forever and those ttys would be
+dead, so half the console is deliberately left on a mechanism with no new moving parts.
+`security-audit` reports a failure if that ever stops being true.
+
+### When the machine is behind NAT
+
+The code carries the address the phone must dial. If the machine is behind NAT with a port
+forwarded to it — a VM under QEMU's user-mode networking, which is how most people meet
+this first — the address it can see is not the address the phone needs, and the code scans
+perfectly and then cannot connect. That failure looks like a broken phone, so it gets its
+own setting in `/etc/bastionos/qrauth.conf`:
+
+```
+advertise = 192.168.1.50:8043
+```
+
+A VM on a **bridged** adapter needs none of this: it gets a real address on your network
+and the phone reaches it directly.
+
+### What an attacker needs
+
+| To do this | They need |
+|---|---|
+| Log in as you | The secret from your phone's browser storage, or your unlocked phone |
+| Replay a captured approval | Nothing works — the nonce is single-use and expires in 90s |
+| Sniff the secret off the network | It never crosses the network; it goes machine → phone optically |
+| Brute-force the challenge | A correct guess in a 2^256 space |
+| Brute-force a typed code | 5 tries per device, then a 5-minute lockout |
+| Lock you out by spamming approvals | Nothing — wrong challenge responses are logged but never counted toward the lockout, precisely so this cannot be used to deny you the offline path |
+| Reach the port at all | To be on a private range, during the ~90s a login is pending |
+
+The network-facing daemon runs as an unprivileged `qrauth` user; the port is bound only
+while something is pending and closed the rest of the time. The privileged half never
+parses anything from the network — it asks the daemon a yes/no question over a local
+socket and, on yes, execs `login -f`.
+
+### Limits worth knowing
+
+- **Console only.** LFS base builds shadow without Linux-PAM, so `sshd` has no hook for a
+  custom auth flow, and SSH stays key-only. This is not something that could be papered
+  over: adding PAM means rebuilding shadow, sudo and OpenSSH against it.
+- **The secret sits in one browser.** Clear its storage and that phone is no longer
+  enrolled. It is not synced, and that is the point.
+- **The QR encoder is hand-written** (`scripts/qrauth/bastion_qr.py`, stdlib only), because
+  making the ability to log in depend on a shared library resolving is a bad trade for 350
+  lines. A QR encoder fails by producing something that looks perfect and does not scan, so
+  it is verified four ways — including decoding the actual pixels off a screenshot of the
+  booted console, which is part of the boot test. See the notes below.
+
 ## Scripts
 
 | Script | Purpose |
@@ -315,10 +545,18 @@ Root SSH login stays disabled.
 | `22-seed-packages.sh` | Build chrony, dcron and log rotation as `bpkg` packages |
 | `23-build-package.sh` / `recipes/` | Build any package from a recipe and install it |
 | `24-build-weathr.sh` | weathr, using a throwaway Rust toolchain |
+| `25-qr-login.sh` | Phone login: daemon, login program, getty and firewall changes |
+| `qrauth/bastion_qr.py` | QR encoder — byte mode, versions 1–10, stdlib only |
+| `qrauth/bastion_auth.py` | Device store, TOTP, and the challenge/response |
+| `qrauth/bastion-qrauthd` | The daemon: local socket, and the page the phone loads |
+| `qrauth/bastion-qrlogin` | The login screen agetty runs on `tty1` and `tty2` |
+| `qrauth/bastion-qradmin` | `register` / `devices` / `revoke`, behind `bastionctl` |
+| `qrauth/phone.html` | The phone's page, with SHA-256 and HMAC written by hand |
+| `qrauth/test-*.py` | Four test layers — see the QR note below |
 | `bpkg.sh` | The package manager, installed as `/usr/bin/bpkg` |
 | `bastionctl.sh` | Operator helper, installed as `/usr/sbin/bastionctl` |
 | `security-audit.sh` | Installed as `/usr/sbin/security-audit` on the image |
-| `ppm2png.py` | Convert a QEMU screendump for inspection |
+| `qemu-screendump.py` / `ppm2png.py` | Photograph the guest's screen and convert it |
 | `render-book.sh` | Render the LFS book locally from its GitHub mirror |
 | `run-lfs.sh` / `run-lfs-gui.sh` | Boot the finished system, text or windowed |
 | `watch-build.sh` / `watch-blfs.sh` | Progress and failure watchers |
@@ -328,6 +566,77 @@ Root SSH login stays disabled.
 
 Things that cost real debugging time and aren't in the book. If you're attempting LFS in a
 similar setup, these are the parts that will bite you.
+
+**A QR encoder fails by producing something that looks perfect.** This is the whole
+problem with writing one. Every bug produces a valid-looking pattern of squares that
+simply does not scan, and there is no error message anywhere. Three real bugs, none of
+which any amount of staring would have found:
+
+- The format information is split **7 modules up the left column and 8 along the top
+  row**, not 8 and 7. Get it backwards and the eighth cell of the column collides with
+  the always-dark module, which overwrites format bit 7 — and leaves one module
+  unclaimed, so a version 1 code has 209 data modules where it should have 208. Every
+  bit after that point shifts by one.
+- The 15-bit format string is placed **most significant bit first**. Placing it the other
+  way round gives a code whose data region is perfectly correct and whose format field is
+  a valid-looking format field *for some other EC level and mask*, so scanners read the
+  wrong level and give up.
+- Versions 2–6 have **7 remainder bits** in the encoding region that no codeword reaches.
+  Not knowing that makes a correct implementation look like it has a placement bug.
+
+So it is checked four ways, three of them automated in the build:
+
+1. **`test-qr.py`** — decodes libqrencode's matrices *using our own layout*, for every
+   version and level over hundreds of payloads. It only succeeds if our zigzag, mask
+   patterns, format placement, block structure and Galois field are all identical to
+   qrencode's, and unlike comparing matrices it does not care which mask was chosen.
+2. **`test-render.py`** — parses our own escape sequences back into a matrix and decodes
+   that, because a correct matrix drawn wrong is still unscannable.
+3. **`test-screen.py`** — decodes the **actual pixels** out of a screenshot of the booted
+   console. This is the one that matters, and it is now part of `09-boot-test.sh`.
+4. A phone, which is the one thing that cannot be automated.
+
+`segno` was the obvious Python oracle and turned out not to be usable as one: its
+`write_padding_bits` does `buff.extend([0] * (8 - (length % 8)))`, which appends a whole
+spurious zero byte when the stream is *already* on a codeword boundary — and in byte mode
+it always is. Harmless, because the extra codeword lands past the terminator where
+decoders stop reading, which is exactly why it has survived. But it means segno and a
+conformant encoder never agree byte-for-byte.
+
+**A VGA text console does not draw half blocks the way you would assume.** Stacking two
+QR modules per character cell with `▀` is the only way a scannable code fits 80×25 — one
+module per cell needs twice the rows. Reading the framebuffer back showed what actually
+gets painted:
+
+```
+cell is 9x16 px, not 8x16          VGA's 9-dot text clock
+▀ fills 7 rows, not 8              so stacked module rows alternate 7 and 9 px tall
+the 9th column takes the BACKGROUND colour, so a dark module gets a 1 px seam on its
+    right whose colour comes from the module below it
+SGR 107 renders as 168,168,168     the Linux console has no bright backgrounds,
+SGR 97  renders as 255,255,255     so there are two different "light" levels
+```
+
+None of that is visible in the escape sequences and all of it is visible to a camera. It
+still decodes — sampling module centres, away from the seam, recovers the payload exactly
+— but "it still decodes" is a measurement, not an assumption, and it took reading pixels
+to get it.
+
+**`sed -i 's/\r$//'` passed inline through PowerShell to `wsl.exe` deletes a trailing
+`r` from every line.** PowerShell eats the backslash, sed receives `s/r$//`, and it
+happily rewrites source files. It corrupted `from collections import Counter` into
+`import Counte` in a scratch file before I noticed. Any `sed` with a backslash has to
+live inside a script file, not on the command line.
+
+**A getty starts before the network does.** init respawns the gettys on entering the
+runlevel, which is routinely before dhcpcd has a lease. The first version gave up
+immediately and fell back to the password prompt — and then `login` sat on the tty until
+*it* timed out, so the code did not appear for another minute either. It waits now.
+
+**`start_daemon` will not start a foreground program**, and reports success anyway. The
+init script printed `[ OK ]`, the daemon was never running, and the only symptom was tty1
+quietly showing a password prompt. The daemon now daemonises and drops privileges itself,
+and the init script reports success only once the socket actually exists.
 
 **Backgrounding the build silently breaks Python.** A shell that starts a background job
 without job control sets `SIGINT`/`SIGQUIT` to `SIG_IGN`, and that disposition is inherited

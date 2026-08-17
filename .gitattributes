@@ -4,5 +4,12 @@
 *.py     text eol=lf
 *.md     text eol=lf
 *.recipe text eol=lf
+*.html   text eol=lf
+# These are Python programs with no extension. A CRLF here reaches the kernel as part
+# of the interpreter path and the failure is "bad interpreter: /usr/bin/python3^M",
+# which on tty1 means nobody can log in.
+scripts/qrauth/bastion-qrauthd text eol=lf
+scripts/qrauth/bastion-qrlogin text eol=lf
+scripts/qrauth/bastion-qradmin text eol=lf
 .gitignore text eol=lf
 .gitattributes text eol=lf

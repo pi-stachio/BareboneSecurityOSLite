@@ -12,10 +12,13 @@ set -uo pipefail
 IMG=${DISK_IMG:-/lfs-disk.img}
 LOG=${BOOT_LOG:-/root/lfs/boot.log}
 SSHLOG=${SSH_LOG:-/root/lfs/ssh.log}
+SCREENLOG=${SCREEN_LOG:-/root/lfs/screen.log}
 PORT=${SSH_PORT:-2222}
+MONPORT=${MON_PORT:-55432}
 ADMINUSER=${ADMINUSER:-admin}
 ADMINPW=${ADMINPW:-lfs}
 KEY=/root/.ssh/id_ed25519
+SCRIPTS=$(cd "$(dirname "$0")" && pwd)
 
 [ -f "$IMG" ] || { echo "FATAL: $IMG not found; run 08-make-bootable-image.sh"; exit 1; }
 [ -f "$KEY" ] || { echo "FATAL: $KEY missing; 08-make-bootable-image.sh creates it"; exit 1; }
@@ -35,14 +38,18 @@ echo "==> Booting $IMG (ssh forwarded to localhost:$PORT)"
 losetup -j "$IMG" -O NAME --noheadings 2>/dev/null | while read -r l; do
     [ -n "$l" ] && { umount "$l"p1 2>/dev/null || true; losetup -d "$l" 2>/dev/null || true; }
 done
-rm -f "$LOG" "$SSHLOG"
+rm -f "$LOG" "$SSHLOG" "$SCREENLOG" /root/lfs/tty1.ppm /root/lfs/tty1.png
+# -vga std and a monitor, so tty1 can be photographed. The phone-login screen never
+# appears on the serial console, so it cannot be checked any other way.
 qemu-system-x86_64 \
     "${ACCEL[@]}" \
     -m 1024 -smp 2 \
     -drive file="$IMG",format=raw,if=ide \
     -netdev user,id=n0,hostfwd=tcp::"$PORT"-:22 \
     -device e1000,netdev=n0 \
-    -display none -serial file:"$LOG" -no-reboot &
+    -display none -vga std \
+    -monitor telnet:127.0.0.1:"$MONPORT",server,nowait \
+    -serial file:"$LOG" -no-reboot &
 QPID=$!
 
 SSH="ssh -i $KEY -p $PORT -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
@@ -60,6 +67,36 @@ for i in $(seq 1 36); do
 done
 
 if [ "$up" = 1 ]; then
+    # Photograph tty1 until a login code appears, rather than once.
+    #
+    # Two clocks make a single photo unreliable. The VGA console stays blank until a
+    # getty starts, and on a first boot that is well after sshd answers -- generating
+    # host keys and growing the filesystem run first, and qrauthd is the last service
+    # to start. Then, once drawn, a code lives 90 seconds before bastion-qrlogin hands
+    # the tty to the password prompt for a minute, so even on a warm boot a single
+    # sample can land in the gap. Sampling until something decodes tests the property
+    # that matters -- a code appears and is readable -- without depending on when.
+    echo "==> Photographing tty1 until a login code appears"
+    : > "$SCREENLOG"
+    shot_ok=0
+    for i in $(seq 1 16); do
+        if python3 "$SCRIPTS/qemu-screendump.py" "$MONPORT" /root/lfs/tty1.ppm \
+               /root/lfs/tty1.png >> "$SCREENLOG" 2>&1 \
+           && python3 "$SCRIPTS/qrauth/test-screen.py" /root/lfs/tty1.ppm \
+               >> "$SCREENLOG" 2>&1; then
+            shot_ok=1
+            echo "    decoded a code from tty1 after ~$((i * 10))s"
+            break
+        fi
+        sleep 10
+    done
+    [ "$shot_ok" = 1 ] || echo "    no code decoded in 160s; see $SCREENLOG"
+
+    echo "==> Copying the phone-login flow test onto the target"
+    scp -i "$KEY" -P "$PORT" -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
+        "$SCRIPTS/qrauth/test-flow.py" "$ADMINUSER@127.0.0.1:/tmp/" > /dev/null 2>&1
+
     echo "==> Running checks over SSH"
     $SSH 'set -x
           hostname
@@ -72,6 +109,12 @@ if [ "$up" = 1 ]; then
           curl -sS -I --max-time 20 https://example.com | head -1
           echo '"$ADMINPW"' | sudo -S id
           echo '"$ADMINPW"' | sudo -S /usr/sbin/bastionctl status
+          echo '"$ADMINPW"' | sudo -S /etc/rc.d/init.d/qrauthd status
+          echo '"$ADMINPW"' | sudo -S python3 /tmp/test-flow.py
+          echo '"$ADMINPW"' | sudo -S /usr/sbin/bastionctl register qruser testphone
+          echo '"$ADMINPW"' | sudo -S /usr/sbin/bastionctl devices
+          echo '"$ADMINPW"' | sudo -S grep "^qruser:" /etc/shadow
+          echo '"$ADMINPW"' | sudo -S sh -c "printf \"id\nexit\n\" | script -qc \"/bin/login -f qruser\" /dev/null"
           echo '"$ADMINPW"' | sudo -S /usr/sbin/security-audit
          ' > "$SSHLOG" 2>&1
     echo "--- ssh session output ---"
@@ -128,6 +171,22 @@ ck 'password hashing is yescrypt'      "$SSHLOG" 'yescrypt password hashing'
 # not asserted here -- only that the system can tell you what it knows it is running.
 ck 'report generated [0-9]{4}-'        "$SSHLOG" 'vulnerability report present'
 ck 'vulnerability report is [0-9]+d old' "$SSHLOG" 'vulnerability report is current'
+# Phone login. The screen check is the one that matters: it decodes the actual pixels
+# tty1 is painting, which is the only way to know the console draws a scannable code
+# rather than something that merely looks like one.
+ck 'bastion-qrauthd is running'        "$SSHLOG" 'phone login daemon started at boot'
+ck 'RESULT: PASS'                      "$SCREENLOG" 'tty1 shows a QR code that decodes'
+ck 'http://[0-9.]+:8043/a\?'           "$SCREENLOG" 'the code on tty1 is a login URL'
+ck 'ran [0-9]+ checks'                 "$SSHLOG" 'phone-login flow test ran on the target'
+ck 'enrolled device .testphone'        "$SSHLOG" 'enrolling a phone works'
+ck '^qruser:\*:'                       "$SSHLOG" 'a phone account has no usable password'
+ck 'uid=[0-9]+\(qruser\)'              "$SSHLOG" 'login -f starts a session for it'
+if grep -qE '^RESULT: FAIL' "$SSHLOG" 2>/dev/null; then
+    printf 'ERROR: %s\n' 'phone-login flow test failed on the target'; fail=1
+    sed -n '/FAIL/p' "$SSHLOG" | head -8
+else
+    printf 'OK:    %s\n' 'phone-login flow test passed on the target'
+fi
 if grep -qE '^ *[0-9]+ passed, [0-9]+ warnings, 0 failures' "$SSHLOG"; then
     printf 'OK:    %s\n' 'security audit reports no failures'
 else

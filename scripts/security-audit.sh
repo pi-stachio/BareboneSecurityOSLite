@@ -273,6 +273,81 @@ else
     warn "bpkg not installed; no package integrity information"
 fi
 
+hdr "Phone login"
+# Phone login puts long-term shared secrets on disk and, while a login is pending, opens
+# a port. Both are worth auditing precisely because they are new: the rest of this system
+# has no listening service beyond sshd and no secret outside /etc/shadow.
+if [ -x /usr/sbin/bastion-qrauthd ]; then
+    QSTORE=/var/lib/bastionos/qrauth
+    if [ -d "$QSTORE" ]; then
+        m=$(stat -c %a "$QSTORE" 2>/dev/null)
+        o=$(stat -c %U "$QSTORE" 2>/dev/null)
+        case "$m" in
+            700|750) ok "device store is mode $m, owned by $o" ;;
+            *) bad "device store is mode $m — group or other can read the secrets" ;;
+        esac
+        loose=$(find "$QSTORE" -type f -perm /0177 2>/dev/null | head -5)
+        if [ -n "$loose" ]; then
+            bad "device secrets readable beyond their owner:"
+            printf '%s\n' "$loose" | sed 's/^/          /'
+        else
+            n=$(find "$QSTORE/devices" -name '*.json' 2>/dev/null | grep -c . || true)
+            ok "$n enrolled device(s), all secrets mode 0600"
+        fi
+    else
+        warn "no device store yet — no phone has been enrolled"
+    fi
+
+    # The daemon must not be root. It is the only part of this system that parses
+    # anything off the network.
+    qpid=$(pgrep -f '/usr/sbin/bastion-qrauthd' 2>/dev/null | head -1)
+    if [ -n "$qpid" ]; then
+        quid=$(awk '/^Uid:/{print $2}' "/proc/$qpid/status" 2>/dev/null)
+        if [ "$quid" = 0 ]; then
+            bad "the phone login daemon is running as root"
+        else
+            ok "phone login daemon runs as uid $quid, not root"
+        fi
+    else
+        warn "phone login daemon is not running — tty1 will show a password prompt"
+    fi
+
+    # The port should be open only while something is pending. Note that the gettys on
+    # tty1 and tty2 each hold a pending login whenever nobody is logged in on them, so
+    # an idle machine sitting at its login screen legitimately has the port open --
+    # which is why this asks the daemon what is pending instead of only looking at ss.
+    qs=$(/usr/sbin/bastion-qradmin status 2>/dev/null)
+    if [ -n "$qs" ]; then
+        qpending=$(printf '%s\n' "$qs" \
+                   | sed -n 's/^ *\([0-9]\+\) login(s) waiting.*/\1/p')
+        qpending=${qpending:-0}
+        if ! printf '%s\n' "$qs" | grep -q 'port .*: open'; then
+            ok "approval port is closed"
+        elif [ "$qpending" -gt 0 ] \
+             || printf '%s\n' "$qs" | grep -q 'enrolment window is open'; then
+            ok "approval port is open, with $qpending login(s) awaiting approval"
+        else
+            warn "approval port is open with nothing pending"
+        fi
+    fi
+
+    # root must not be enrolled: it is the way back in when a phone is lost.
+    if [ -d "$QSTORE/devices" ] \
+       && grep -l '"user": *"root"' "$QSTORE"/devices/*.json > /dev/null 2>&1; then
+        bad "root has a phone enrolled — keep a password-only path to the console"
+    else
+        ok "root is not enrolled (password remains the way back in)"
+    fi
+
+    # At least one getty must still offer a password, or a broken daemon locks everyone
+    # out of the console entirely.
+    if grep -qE '^[0-9]+:2345:respawn:/sbin/agetty [^-]' /etc/inittab 2>/dev/null; then
+        ok "a plain password getty remains for recovery"
+    else
+        bad "every getty uses phone login — a daemon failure locks out the console"
+    fi
+fi
+
 hdr "Time synchronisation"
 # A drifting clock breaks TLS with errors that blame the certificate, and makes every
 # log timestamp and the advisory report's date meaningless.

@@ -13,6 +13,7 @@ set -euo pipefail
 
 IMG=${DISK_IMG:-/lfs-disk.img}
 PORT=${SSH_PORT:-2222}
+QRPORT=${QR_PORT:-8043}
 [ -f "$IMG" ] || { echo "FATAL: $IMG not found"; exit 1; }
 [ -n "${DISPLAY:-}" ] || { echo "FATAL: no DISPLAY; WSLg not available"; exit 1; }
 
@@ -34,14 +35,22 @@ else
 fi
 
 echo "Opening a QEMU window  ($(basename "$IMG"), format=$FMT)"
+echo "  tty1  : phone login (scan the QR code).  Alt-F3 for a password prompt."
 echo "  login : root / lfs   or   admin / lfs"
 echo "  ssh   : refuses passwords and ships no key. From the guest console, run"
 echo "          bastionctl add-key 'ssh-ed25519 AAAA... you@host'"
 echo "          then: ssh -p $PORT admin@localhost"
+echo
+echo "  Tapping Approve on a phone needs the phone to reach the guest, and user-mode"
+echo "  networking NATs it. Port $QRPORT is forwarded, but the guest still has to be"
+echo "  told the address the phone will use -- on the guest:"
+echo "          echo 'advertise = <this-machine-lan-ip>:$QRPORT' >> /etc/bastionos/qrauth.conf"
+echo "          /etc/rc.d/init.d/qrauthd restart"
+echo "  The typed-code path ([c] on the login screen) needs none of that."
 exec qemu-system-x86_64 \
     "${ACCEL[@]}" \
     -m "${MEM:-2048}" -smp "${CPUS:-2}" \
     -drive file="$IMG",format="$FMT",if=ide \
-    -netdev user,id=n0,hostfwd=tcp::"$PORT"-:22 \
+    -netdev user,id=n0,hostfwd=tcp::"$PORT"-:22,hostfwd=tcp::"$QRPORT"-:"$QRPORT" \
     -device e1000,netdev=n0 \
     -display gtk -vga std -no-reboot

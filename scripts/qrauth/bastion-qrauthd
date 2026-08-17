@@ -1,0 +1,623 @@
+#!/usr/bin/python3
+"""bastion-qrauthd -- mediates phone login for BastionOS.
+
+Two faces:
+
+  a Unix socket at /run/bastionos/qrauth.sock, which only root can reach, used by
+  bastion-qrlogin to open a login session and by bastionctl to enrol and revoke devices;
+
+  an HTTP listener on the local network, which the phone talks to.
+
+The HTTP listener is bound only while something is actually pending -- a login waiting
+for approval, or a five-minute enrolment window -- and closed again as soon as nothing
+is. On a machine whose whole point is a small attack surface, a login mechanism should
+not cost a permanently open port; it costs one for ninety seconds at a time.
+
+It runs as the unprivileged 'qrauth' user. That does not make a compromise harmless,
+since this process decides who gets logged in, but it does mean the network-facing code
+is not running as root. The privileged half is bastion-qrlogin, which never parses
+anything from the network -- it asks this daemon a yes/no question over a local socket
+and, on yes, execs `login -f`.
+"""
+import base64
+import json
+import os
+import pwd
+import re
+import secrets
+import socket
+import socketserver
+import struct
+import sys
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+sys.path.insert(0, "/usr/lib/bastionos")
+# Also look beside this script, so the flow can be exercised from a source tree on the
+# build host without installing anything.
+sys.path.insert(1, os.path.dirname(os.path.abspath(__file__)))
+import bastion_auth as auth  # noqa: E402
+
+# Overridable only to make the daemon testable off-target; the installed unit uses the
+# defaults and never sets these.
+SOCK = os.environ.get("BASTION_QRAUTH_SOCK", "/run/bastionos/qrauth.sock")
+PAGE = os.environ.get("BASTION_QRAUTH_PAGE", "/usr/lib/bastionos/phone.html")
+CONF = os.environ.get("BASTION_QRAUTH_CONF", "/etc/bastionos/qrauth.conf")
+
+DEFAULT_PORT = 8043
+LOGIN_TTL = 90          # seconds a console code stays valid
+ENROL_TTL = 300         # how long the enrolment page stays reachable
+MAX_BODY = 4096         # bytes; anything larger is refused unread
+MAX_ATTEMPTS = 10       # approval attempts per session
+
+_lock = threading.RLock()
+_sessions = {}          # sid -> dict
+_enrol = None           # dict or None
+_port = DEFAULT_PORT
+_advertise = None
+_hostname = "bastion"
+
+
+def log(msg):
+    sys.stderr.write("%s qrauth: %s\n"
+                     % (time.strftime("%Y-%m-%dT%H:%M:%S"), msg))
+    sys.stderr.flush()
+
+
+def read_conf():
+    global _port, _advertise
+    try:
+        with open(CONF) as fh:
+            for line in fh:
+                line = line.split("#", 1)[0].strip()
+                if not line or "=" not in line:
+                    continue
+                k, v = (x.strip() for x in line.split("=", 1))
+                if k == "port":
+                    _port = int(v)
+                elif k == "advertise":
+                    _advertise = v or None
+    except (IOError, ValueError):
+        pass
+
+
+def base_url():
+    """The URL a phone must use to reach this machine.
+
+    Normally that is simply this machine's own address. It is not, when the machine is
+    behind NAT with a port forwarded to it -- a VM under QEMU's user-mode networking,
+    which is how most people meet this first. There the address the machine can see is
+    10.0.2.15 and the address the phone has to use belongs to the host, so putting the
+    former in the QR code produces something that scans perfectly and then cannot
+    connect. Set `advertise` in qrauth.conf for that case.
+    """
+    if _advertise:
+        adv = _advertise if "://" in _advertise else "http://" + _advertise
+        return adv.rstrip("/")
+    addr = primary_address()
+    return "http://%s:%d" % (addr, _port) if addr else None
+
+
+def primary_address():
+    """The address a phone on this network would use to reach us.
+
+    Uses a connectionless UDP socket to ask the routing table which source address
+    would be chosen for an off-link destination. Nothing is transmitted; the address
+    used is TEST-NET-1, which exists precisely so it can be named without meaning it.
+    """
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("192.0.2.1", 9))
+            return s.getsockname()[0]
+        finally:
+            s.close()
+    except OSError:
+        pass
+    # No default route. Fall back to any global address on any interface.
+    try:
+        import subprocess
+        out = subprocess.run(["/usr/sbin/ip", "-o", "-4", "addr", "show", "scope",
+                              "global"], capture_output=True, timeout=5).stdout.decode()
+        for line in out.splitlines():
+            parts = line.split()
+            if len(parts) >= 4:
+                return parts[3].split("/")[0]
+    except Exception:
+        pass
+    return None
+
+
+# ---------------------------------------------------------------------------
+# The HTTP face
+# ---------------------------------------------------------------------------
+
+class Handler(BaseHTTPRequestHandler):
+    server_version = "bastion-qrauthd"
+    sys_version = ""
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, fmt, *args):
+        pass                      # the daemon logs the events that matter, not requests
+
+    def _send(self, code, body, ctype="application/json"):
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        # Nothing here should be cached; a stale approve page holds a dead nonce.
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _json(self, code, obj):
+        self._send(code, json.dumps(obj))
+
+    def _page(self, data):
+        try:
+            with open(PAGE, "r", encoding="utf-8") as fh:
+                html = fh.read()
+        except IOError:
+            self._json(500, {"ok": False, "error": "page missing"})
+            return
+        self._send(200, html.replace("__BASTION_DATA__", json.dumps(data)),
+                   "text/html; charset=utf-8")
+
+    def do_GET(self):
+        path, _, query = self.path.partition("?")
+        if path == "/a":
+            with _lock:
+                sess = _sessions.get(query)
+                if not sess or sess["state"] != "pending" or sess["expires"] < time.time():
+                    self._send(200, "<!DOCTYPE html><meta charset=utf-8>"
+                               "<body style='font:17px sans-serif;background:#14161a;"
+                               "color:#e6e8ea;padding:2rem'>That login code has expired."
+                               " Get a fresh one on the console.",
+                               "text/html; charset=utf-8")
+                    return
+                data = {"mode": "approve", "sid": query, "nonce": sess["nonce"],
+                        "tty": sess["tty"], "host": _hostname, "addr": sess["addr"]}
+            self._page(data)
+        elif path == "/e":
+            with _lock:
+                if not _enrol or _enrol["expires"] < time.time():
+                    self._send(200, "<!DOCTYPE html><meta charset=utf-8>"
+                               "<body style='font:17px sans-serif;background:#14161a;"
+                               "color:#e6e8ea;padding:2rem'>No enrolment is in progress."
+                               " Run <code>bastionctl register</code> on the console.",
+                               "text/html; charset=utf-8")
+                    return
+                data = {"mode": "enrol", "user": _enrol["user"], "host": _hostname,
+                        "addr": _enrol["addr"]}
+            self._page(data)
+        else:
+            self._json(404, {"ok": False, "error": "no"})
+
+    def do_POST(self):
+        if self.path != "/r":
+            self._json(404, {"ok": False, "error": "no"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            self._json(400, {"ok": False, "error": "bad length"})
+            return
+        # Refuse oversized bodies without reading them.
+        if length <= 0 or length > MAX_BODY:
+            self._json(413, {"ok": False, "error": "too large"})
+            return
+        try:
+            body = json.loads(self.rfile.read(length).decode("utf-8", "replace"))
+            sid = str(body["sid"])
+            devid = str(body["devid"])
+            resp = str(body["resp"])
+        except (ValueError, KeyError, TypeError):
+            self._json(400, {"ok": False, "error": "bad request"})
+            return
+
+        with _lock:
+            sess = _sessions.get(sid)
+            if not sess or sess["expires"] < time.time():
+                self._json(410, {"ok": False, "error": "that code has expired"})
+                return
+            if sess["state"] != "pending":
+                self._json(409, {"ok": False, "error": "already used"})
+                return
+            sess["attempts"] += 1
+            if sess["attempts"] > MAX_ATTEMPTS:
+                sess["state"] = "expired"
+                log("session %s on %s: too many attempts, abandoned" % (sid, sess["tty"]))
+                self._json(429, {"ok": False, "error": "too many attempts"})
+                return
+            nonce, tty = sess["nonce"], sess["tty"]
+
+        try:
+            user = auth.verify_challenge(devid, nonce, resp)
+        except auth.AuthError as exc:
+            log("REJECT %s on %s: %s" % (devid, tty, exc))
+            self._json(403, {"ok": False, "error": str(exc)})
+            return
+
+        with _lock:
+            sess = _sessions.get(sid)
+            # Re-check under the lock: two phones could race the same code.
+            if not sess or sess["state"] != "pending":
+                self._json(409, {"ok": False, "error": "already used"})
+                return
+            sess["state"] = "approved"
+            sess["user"] = user
+        log("APPROVE %s as %s on %s" % (devid, user, tty))
+        self._json(200, {"ok": True, "user": user})
+
+
+class Listener:
+    """The HTTP server, bound only while there is something to serve."""
+
+    def __init__(self):
+        self.srv = None
+        self.thread = None
+
+    def up(self):
+        if self.srv:
+            return True
+        try:
+            socketserver.TCPServer.allow_reuse_address = True
+            self.srv = ThreadingHTTPServer(("0.0.0.0", _port), Handler)
+        except OSError as exc:
+            log("cannot bind port %d: %s" % (_port, exc))
+            self.srv = None
+            return False
+        self.srv.daemon_threads = True
+        self.thread = threading.Thread(target=self.srv.serve_forever,
+                                       kwargs={"poll_interval": 0.3}, daemon=True)
+        self.thread.start()
+        log("listening on 0.0.0.0:%d" % _port)
+        return True
+
+    def down(self):
+        if not self.srv:
+            return
+        self.srv.shutdown()
+        self.srv.server_close()
+        self.thread.join(timeout=5)
+        self.srv = self.thread = None
+        log("stopped listening")
+
+
+_listener = Listener()
+
+
+def refresh_listener():
+    """Bind while anything is pending, unbind when nothing is."""
+    now = time.time()
+    with _lock:
+        for sid in [s for s, v in _sessions.items()
+                    if v["expires"] < now and v["state"] == "pending"]:
+            _sessions[sid]["state"] = "expired"
+        for sid in [s for s, v in _sessions.items() if v["expires"] < now - 300]:
+            del _sessions[sid]
+        wanted = any(v["state"] == "pending" for v in _sessions.values()) \
+            or (_enrol is not None and _enrol["expires"] >= now)
+    if wanted:
+        _listener.up()
+    else:
+        _listener.down()
+
+
+# ---------------------------------------------------------------------------
+# The Unix socket face
+# ---------------------------------------------------------------------------
+
+def op_login_new(req):
+    tty = str(req.get("tty", "console"))[:16]
+    if not re.match(r"^[A-Za-z0-9/_-]*$", tty):
+        return {"ok": False, "error": "bad tty"}
+    base = base_url()
+    if not base:
+        return {"ok": False, "error": "this machine has no network address, "
+                                      "so a phone cannot reach it"}
+    # 48 bits is plenty: the id only has to be unique among a handful of live
+    # sessions. Knowing it does not help anyone approve -- that needs the device
+    # secret -- so it is not a bearer token.
+    sid = secrets.token_hex(6)
+    nonce = secrets.token_hex(16)
+    with _lock:
+        _sessions[sid] = {"nonce": nonce, "tty": tty, "state": "pending",
+                          "user": None, "attempts": 0,
+                          "addr": base.split("://", 1)[-1],
+                          "created": time.time(), "expires": time.time() + LOGIN_TTL}
+    refresh_listener()
+    return {"ok": True, "sid": sid, "nonce": nonce, "ttl": LOGIN_TTL,
+            "url": "%s/a?%s" % (base, sid)}
+
+
+def op_login_poll(req):
+    sid = str(req.get("sid", ""))
+    refresh_listener()
+    with _lock:
+        sess = _sessions.get(sid)
+        if not sess:
+            return {"ok": False, "error": "no such session"}
+        out = {"ok": True, "state": sess["state"], "user": sess["user"],
+               "remaining": max(0, int(sess["expires"] - time.time()))}
+        if sess["state"] == "approved":
+            # One use only. Reading the result consumes it.
+            sess["state"] = "spent"
+    return out
+
+
+def op_login_cancel(req):
+    with _lock:
+        _sessions.pop(str(req.get("sid", "")), None)
+    refresh_listener()
+    return {"ok": True}
+
+
+def op_totp(req):
+    user = str(req.get("user", ""))
+    try:
+        devid = auth.verify_totp(user, str(req.get("code", "")))
+    except auth.AuthError as exc:
+        log("REJECT typed code for %s: %s" % (user, exc))
+        return {"ok": False, "error": str(exc)}
+    log("APPROVE %s as %s by typed code" % (devid, user))
+    return {"ok": True, "devid": devid, "user": user}
+
+
+def op_register(req):
+    global _enrol
+    user = str(req.get("user", ""))
+    name = str(req.get("name", "phone"))
+    base = base_url()
+    try:
+        devid, secret = auth.add_device(user, name)
+    except auth.AuthError as exc:
+        return {"ok": False, "error": str(exc)}
+    with _lock:
+        _enrol = {"user": user, "devid": devid, "expires": time.time() + ENROL_TTL,
+                  "addr": base.split("://", 1)[-1] if base else None}
+    refresh_listener()
+    log("ENROL %s as device %s (%s)" % (user, devid, name))
+    return {"ok": True, "devid": devid, "user": user, "name": name,
+            "url": auth.enroll_uri(base, devid, secret) if base else None,
+            "totp_uri": auth.totp_uri(user, _hostname, secret),
+            "secret": base64.b32encode(secret).decode().rstrip("="),
+            "ttl": ENROL_TTL, "addr": base}
+
+
+def op_devices(req):
+    user = req.get("user")
+    out = []
+    for devid, rec in auth.list_devices(user):
+        out.append({"devid": devid, "user": rec.get("user"), "name": rec.get("name"),
+                    "created": rec.get("created"), "last_used": rec.get("last_used"),
+                    "locked_until": rec.get("locked_until", 0)})
+    return {"ok": True, "devices": out}
+
+
+def op_revoke(req):
+    devid = str(req.get("devid", ""))
+    try:
+        auth.remove_device(devid)
+    except (auth.AuthError, OSError) as exc:
+        return {"ok": False, "error": str(exc)}
+    log("REVOKE device %s" % devid)
+    return {"ok": True}
+
+
+def op_status(req):
+    refresh_listener()
+    with _lock:
+        pending = sum(1 for v in _sessions.values() if v["state"] == "pending")
+        enrolling = bool(_enrol and _enrol["expires"] >= time.time())
+    return {"ok": True, "port": _port, "listening": _listener.srv is not None,
+            "pending": pending, "enrolling": enrolling,
+            "base": base_url(), "advertised": bool(_advertise),
+            "devices": len(auth.list_devices())}
+
+
+OPS = {
+    "login_new": op_login_new, "login_poll": op_login_poll,
+    "login_cancel": op_login_cancel, "totp": op_totp, "register": op_register,
+    "devices": op_devices, "revoke": op_revoke, "status": op_status,
+}
+
+# Everything that grants a login, enrols, revokes, or checks a code is root-only. What
+# is left is read-only and tells the caller nothing they should not already know, so
+# ordinary users get it -- scoped to themselves.
+#
+# This matters more than it looks. An account you log into with your phone has no
+# password by design, so it cannot sudo, so requiring root to answer "which phones can
+# log in as me?" means the person it concerns is the one person who cannot ask.
+UNPRIVILEGED_OPS = {"devices", "status"}
+
+
+def peer_of(conn):
+    """The uid on the other end of the socket, from the kernel rather than the caller."""
+    try:
+        creds = conn.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
+                                struct.calcsize("3i"))
+        _pid, uid, _gid = struct.unpack("3i", creds)
+        return uid
+    except (OSError, struct.error):
+        return None
+
+
+def authorise(req, uid):
+    """Return (op_name, error). Rewrites the request to the caller's own scope."""
+    op = str(req.get("op", ""))
+    if op not in OPS:
+        return None, "unknown op"
+    if uid == 0:
+        return op, None
+    if op not in UNPRIVILEGED_OPS:
+        return None, "that needs root"
+    if op == "devices":
+        # Not a filter the caller chose -- one they cannot change. Asking for someone
+        # else's devices quietly returns your own rather than erroring, because the
+        # alternative leaks whether that account exists.
+        try:
+            req["user"] = pwd.getpwuid(uid).pw_name
+        except KeyError:
+            return None, "no account for uid %d" % uid
+    return op, None
+
+
+def serve_control():
+    try:
+        os.unlink(SOCK)
+    except OSError:
+        pass
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(SOCK)
+    # Any local user may connect; what they may then ask is decided per request from
+    # the kernel-supplied peer uid, not from anything they send. See authorise().
+    os.chmod(SOCK, 0o666)
+    srv.listen(8)
+    log("ready")
+    while True:
+        try:
+            conn, _ = srv.accept()
+        except OSError:
+            continue
+        try:
+            conn.settimeout(10)
+            uid = peer_of(conn)
+            data = b""
+            while b"\n" not in data and len(data) < MAX_BODY:
+                chunk = conn.recv(1024)
+                if not chunk:
+                    break
+                data += chunk
+            req = json.loads(data.decode("utf-8", "replace").split("\n", 1)[0])
+            if uid is None:
+                reply = {"ok": False, "error": "cannot identify the caller"}
+            else:
+                op, why = authorise(req, uid)
+                reply = OPS[op](req) if op else {"ok": False, "error": why}
+        except Exception as exc:                       # never take the daemon down
+            reply = {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+        try:
+            conn.sendall((json.dumps(reply) + "\n").encode())
+        except OSError:
+            pass
+        conn.close()
+
+
+def reaper():
+    """Expire sessions and close the port even if nobody is polling."""
+    while True:
+        time.sleep(5)
+        try:
+            refresh_listener()
+        except Exception as exc:
+            log("reaper: %s" % exc)
+
+
+def drop_privileges(username):
+    """Become an unprivileged user, and refuse to continue if that did not happen.
+
+    The listener binds 8043, so nothing here needs root once /run/bastionos exists --
+    which the init script creates, because that part does.
+    """
+    import grp
+    import pwd
+    try:
+        pw = pwd.getpwnam(username)
+    except KeyError:
+        raise SystemExit("no such user: %s" % username)
+    if os.getuid() == 0:
+        try:
+            os.setgroups([])
+        except OSError:
+            pass
+        os.setgid(pw.pw_gid)
+        os.setuid(pw.pw_uid)
+        os.environ["HOME"] = pw.pw_dir
+    if os.getuid() == 0 or os.geteuid() == 0:
+        raise SystemExit("refusing to run as root")
+    del grp
+
+
+def daemonize(logpath, pidfile):
+    """Detach, and point stdout/stderr at the log. Called after dropping privileges."""
+    try:
+        fd = os.open(logpath, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o640)
+    except OSError:
+        # A daemon that will not start because it cannot open its log is worse than
+        # one that runs without one.
+        fd = os.open("/dev/null", os.O_WRONLY)
+    if os.fork() > 0:
+        os._exit(0)
+    os.setsid()
+    if os.fork() > 0:
+        os._exit(0)
+    os.chdir("/")
+    null = os.open("/dev/null", os.O_RDONLY)
+    os.dup2(null, 0)
+    os.dup2(fd, 1)
+    os.dup2(fd, 2)
+    if pidfile:
+        try:
+            with open(pidfile, "w") as fh:
+                fh.write("%d\n" % os.getpid())
+        except IOError as exc:
+            log("cannot write %s: %s" % (pidfile, exc))
+
+
+def main():
+    global _hostname
+    args = sys.argv[1:]
+
+    def opt(name, default=None):
+        return args[args.index(name) + 1] if name in args else default
+
+    user = opt("--user")
+    pidfile = opt("--pidfile")
+    logpath = opt("--log", "/var/log/bastionos/qrauth.log")
+
+    read_conf()
+    try:
+        with open("/etc/hostname") as fh:
+            _hostname = fh.read().strip() or "bastion"
+    except IOError:
+        pass
+
+    if user:
+        drop_privileges(user)
+    os.umask(0o077)
+    auth.init_store()
+    if "--daemonize" in args:
+        daemonize(logpath, pidfile)
+
+    # Leave no stale socket behind. SIGTERM does not run atexit handlers on its own,
+    # so turn it into a normal exit first -- otherwise a restart finds a socket file
+    # that exists, cannot be connected to, and reports "connection refused" rather
+    # than anything that points at the real problem.
+    import atexit
+    import signal
+
+    def cleanup():
+        try:
+            os.unlink(SOCK)
+        except OSError:
+            pass
+        if pidfile:
+            try:
+                os.unlink(pidfile)
+            except OSError:
+                pass
+
+    atexit.register(cleanup)
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    signal.signal(signal.SIGINT, lambda *_: sys.exit(0))
+
+    threading.Thread(target=reaper, daemon=True).start()
+    serve_control()
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,365 @@
+#!/usr/bin/python3
+"""bastion-qrlogin -- the console login screen you scan with a phone.
+
+Installed as the login program of a getty:
+
+    1:2345:respawn:/sbin/agetty -n -l /usr/sbin/bastion-qrlogin --noclear tty1 linux
+
+-n stops agetty asking for a username, because there is nothing to type: the QR code
+carries a one-time nonce, and whichever enrolled phone answers it decides which account
+is being logged in.
+
+On success this execs `login -f <user>`, so utmp, wtmp, the environment, the motd and
+ownership of the tty are all handled by the same program that would have handled them
+after a password. Nothing here reimplements becoming a user.
+
+If anything at all goes wrong -- the daemon is not running, the machine has no address,
+Python itself is broken -- this falls through to `exec /bin/login`, giving the ordinary
+password prompt. A login screen must not have a single point of failure, and a phone is
+one.
+"""
+import json
+import os
+import socket
+import sys
+import termios
+import time
+import tty
+
+sys.path.insert(0, "/usr/lib/bastionos")
+
+SOCK = "/run/bastionos/qrauth.sock"
+FALLBACK = "/bin/login"
+# Drawing above this version needs more rows than an 80x25 console has.
+MAX_QR_VERSION = 5
+# How long to wait for a network address and for qrauthd, before giving up and handing
+# the tty to the password prompt.
+NETWORK_WAIT = 25
+
+ESC = "\033"
+
+
+def fallback(reason=None):
+    """Hand over to the ordinary password login."""
+    if reason:
+        try:
+            sys.stdout.write("\r\n  phone login unavailable (%s); password login:\r\n\r\n"
+                             % reason)
+            sys.stdout.flush()
+        except Exception:
+            pass
+    try:
+        os.execv(FALLBACK, [FALLBACK])
+    except OSError:
+        os._exit(1)
+
+
+def ask(req, timeout=10):
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(SOCK)
+        s.sendall((json.dumps(req) + "\n").encode())
+        data = b""
+        while b"\n" not in data and len(data) < 65536:
+            chunk = s.recv(4096)
+            if not chunk:
+                break
+            data += chunk
+        return json.loads(data.decode("utf-8", "replace").split("\n", 1)[0])
+    finally:
+        s.close()
+
+
+def tty_name():
+    for fd in (0, 1, 2):
+        try:
+            return os.path.basename(os.ttyname(fd))
+        except OSError:
+            continue
+    return "console"
+
+
+class Screen:
+    """Absolute cursor addressing, so the countdown can update without redrawing."""
+
+    def __init__(self):
+        try:
+            size = os.get_terminal_size()
+            self.cols, self.rows = size.columns, size.lines
+        except OSError:
+            self.cols, self.rows = 80, 25
+
+    def write(self, s):
+        sys.stdout.write(s)
+
+    def flush(self):
+        sys.stdout.flush()
+
+    def clear(self):
+        self.write(ESC + "[2J" + ESC + "[H")
+
+    def at(self, row, col, s):
+        self.write("%s[%d;%dH%s" % (ESC, row + 1, col + 1, s))
+
+    def hide_cursor(self):
+        self.write(ESC + "[?25l")
+
+    def show_cursor(self):
+        self.write(ESC + "[?25h")
+
+
+QR_TOP = 2
+# Row in the left-hand column where the countdown is redrawn. It lives there rather
+# than under the code because a version 5 symbol is 23 rows tall and, starting at
+# QR_TOP, reaches the last line of an 80x25 console -- there is no row beneath it.
+COUNTDOWN_ROW = QR_TOP + 10
+
+
+def draw(screen, qr_lines, qr_width, url, host, tty, note=None):
+    screen.clear()
+    screen.at(0, 0, "BastionOS")
+    right = "%s %s" % (host, tty)
+    screen.at(0, max(0, screen.cols - len(right)), right)
+
+    # Code on the right, instructions on the left, so a narrow console degrades by
+    # truncating words rather than by cutting the code in half.
+    qr_col = max(0, screen.cols - qr_width - 1)
+    for i, line in enumerate(qr_lines):
+        if QR_TOP + i >= screen.rows:
+            break
+        screen.at(QR_TOP + i, qr_col, line)
+
+    text = [
+        "Scan to log in",
+        "",
+        "  1. point your phone's camera",
+        "     at the code",
+        "  2. tap Approve",
+        "",
+        "No phone on this network?",
+        "  press [c] to type a code",
+        "",
+        "  press [p] for a password",
+    ]
+    width = max(0, qr_col - 2)
+    for i, line in enumerate(text):
+        if QR_TOP + i < screen.rows - 1:
+            screen.at(QR_TOP + i, 0, line[:width])
+    if note:
+        screen.at(screen.rows - 1, 0, note[:screen.cols - 1])
+    screen.flush()
+
+
+def countdown(screen, width, remaining):
+    screen.at(COUNTDOWN_ROW, 0, ("  expires in %2ds" % remaining)[:width])
+    screen.flush()
+
+
+def read_key(timeout):
+    """A single keypress, or None if nothing arrived in time."""
+    import select
+    r, _, _ = select.select([sys.stdin], [], [], timeout)
+    if not r:
+        return None
+    try:
+        return os.read(sys.stdin.fileno(), 1).decode("latin-1")
+    except OSError:
+        return None
+
+
+def prompt(screen, label, echo=True, limit=64):
+    """Read a line with the terminal back in a sane mode."""
+    screen.show_cursor()
+    screen.write("\r\n" + label)
+    screen.flush()
+    old = termios.tcgetattr(sys.stdin.fileno())
+    new = termios.tcgetattr(sys.stdin.fileno())
+    new[3] |= termios.ICANON | (termios.ECHO if echo else 0)
+    if not echo:
+        new[3] &= ~termios.ECHO
+    termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, new)
+    try:
+        line = sys.stdin.readline()
+    finally:
+        termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, old)
+    return (line or "").strip()[:limit]
+
+
+def do_typed_code(screen):
+    """The offline path: a TOTP code from an authenticator app."""
+    user = prompt(screen, "account: ")
+    if not user:
+        return None
+    code = prompt(screen, "6-digit code: ")
+    if not code:
+        return None
+    try:
+        reply = ask({"op": "totp", "user": user, "code": code})
+    except (OSError, ValueError) as exc:
+        screen.write("\r\n  cannot reach the login daemon: %s\r\n" % exc)
+        screen.flush()
+        time.sleep(2)
+        return None
+    if reply.get("ok"):
+        return reply["user"]
+    screen.write("\r\n  %s\r\n" % reply.get("error", "refused"))
+    screen.flush()
+    time.sleep(2)
+    return None
+
+
+def open_session(tty_id):
+    """Ask for a login session, allowing for the parts of the system that arrive late.
+
+    init respawns a getty as soon as it enters the runlevel, which is routinely before
+    dhcpcd has a lease and can be before qrauthd has finished starting. Giving up at
+    that moment is wrong twice over: the machine is a few seconds away from being able
+    to do this, and the fallback then parks login(1) on the tty until it times out, so
+    the code does not appear for another minute either.
+
+    Only conditions that genuinely resolve themselves are waited on. A machine with no
+    network at all still reaches the password prompt, just NETWORK_WAIT seconds later.
+    """
+    deadline = time.monotonic() + NETWORK_WAIT
+    announced = False
+    while True:
+        try:
+            reply = ask({"op": "login_new", "tty": tty_id})
+        except (OSError, ValueError):
+            reply = {"ok": False, "error": "login daemon not running", "wait": True}
+        if reply.get("ok"):
+            return reply, None
+        why = reply.get("error", "daemon refused")
+        transient = reply.get("wait") or "network address" in why
+        if not transient or time.monotonic() >= deadline:
+            return None, why
+        if not announced:
+            sys.stdout.write("\r\n  BastionOS: waiting for the network...\r\n")
+            sys.stdout.flush()
+            announced = True
+        time.sleep(1.5)
+
+
+def become(user):
+    """Hand off to login(1), which owns everything about starting a session."""
+    sys.stdout.write(ESC + "[?25h" + "\r\n")
+    sys.stdout.flush()
+    os.execv(FALLBACK, [FALLBACK, "-f", user])
+    os._exit(1)
+
+
+def main():
+    if os.geteuid() != 0:
+        sys.exit("bastion-qrlogin must run as root")
+
+    try:
+        import bastion_qr
+    except Exception as exc:
+        fallback("QR encoder unavailable: %s" % exc)
+
+    tty_id = tty_name()
+    try:
+        with open("/etc/hostname") as fh:
+            host = fh.read().strip() or "bastion"
+    except IOError:
+        host = "bastion"
+
+    session, why = open_session(tty_id)
+    if session is None:
+        fallback(why)
+        return
+
+    sid, url = session["sid"], session["url"]
+    try:
+        matrix, version = bastion_qr.encode(url, "M")
+        if version > MAX_QR_VERSION:
+            raise bastion_qr.QRError("version %d needs more rows than this console has"
+                                     % version)
+        qr_lines = bastion_qr.to_halfblocks(matrix)
+        qr_width = bastion_qr.width_halfblocks(matrix)
+    except Exception as exc:
+        # Most likely a long address pushing the code past what fits. The typed-code
+        # path still works, so say so rather than falling back silently.
+        try:
+            ask({"op": "login_cancel", "sid": sid})
+        except Exception:
+            pass
+        fallback("cannot draw a code for %s (%s)" % (url, exc))
+        return
+
+    screen = Screen()
+    stdin_fd = sys.stdin.fileno()
+    try:
+        old_term = termios.tcgetattr(stdin_fd)
+    except termios.error:
+        old_term = None
+
+    approved = None
+    try:
+        if old_term:
+            tty.setcbreak(stdin_fd)
+        screen.hide_cursor()
+        qr_col = max(0, screen.cols - qr_width - 1)
+        text_width = max(0, qr_col - 2)
+        draw(screen, qr_lines, qr_width, url, host, tty_id)
+
+        last_shown = -1
+        while True:
+            try:
+                reply = ask({"op": "login_poll", "sid": sid}, timeout=5)
+            except (OSError, ValueError):
+                break
+            if not reply.get("ok"):
+                break
+            state = reply.get("state")
+            if state == "approved":
+                approved = reply.get("user")
+                break
+            if state in ("expired", "spent"):
+                break
+            remaining = reply.get("remaining", 0)
+            if remaining != last_shown:
+                countdown(screen, text_width, remaining)
+                last_shown = remaining
+
+            key = read_key(0.5)
+            if key in ("c", "C"):
+                if old_term:
+                    termios.tcsetattr(stdin_fd, termios.TCSANOW, old_term)
+                user = do_typed_code(screen)
+                if user:
+                    approved = user
+                    break
+                if old_term:
+                    tty.setcbreak(stdin_fd)
+                screen.hide_cursor()
+                draw(screen, qr_lines, qr_width, url, host, tty_id)
+                last_shown = -1
+            elif key in ("p", "P"):
+                break
+            elif key in ("q", "Q"):
+                break
+    finally:
+        if old_term:
+            try:
+                termios.tcsetattr(stdin_fd, termios.TCSANOW, old_term)
+            except termios.error:
+                pass
+        screen.show_cursor()
+        if approved is None:
+            try:
+                ask({"op": "login_cancel", "sid": sid})
+            except Exception:
+                pass
+
+    if approved:
+        become(approved)
+    # Nothing approved: clear up and let the ordinary password login have the tty.
+    sys.stdout.write(ESC + "[2J" + ESC + "[H")
+    sys.stdout.flush()
+    fallback()
+
+
+if __name__ == "__main__":
+    main()
